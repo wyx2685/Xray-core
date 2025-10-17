@@ -37,7 +37,16 @@ func init() {
 
 // Inbound is an inbound connection handler that handles Hysteria2 protocol
 type Inbound struct {
-	sync.Mutex
+	userMap sync.Map // email -> *protocol.MemoryUser
+	// Fast-path structures to avoid full map scan on every update
+	uMu          sync.RWMutex
+	userList     []string
+	passwordList []string
+	emailIndex   map[string]int // email -> index in userList/passwordList
+	// Coalesced update machinery for massive AddUser bursts
+	updateCh      chan struct{}
+	stopCh        chan struct{}
+	debounce      time.Duration
 	policyManager policy.Manager
 	config        *ServerConfig
 	ctx           context.Context
@@ -45,8 +54,6 @@ type Inbound struct {
 	localaddr     gonet.Addr
 	service       *hysteria2.Service[string]
 	cancel        context.CancelFunc
-	users         []*protocol.MemoryUser          // user list
-	userMap       map[string]*protocol.MemoryUser // password -> user
 }
 
 // NewServer creates a new Hysteria2 inbound handler
@@ -57,10 +64,13 @@ func NewServer(ctx context.Context, config *ServerConfig) (*Inbound, error) {
 		policyManager: v.GetFeature(policy.ManagerType()).(policy.Manager),
 		config:        config,
 		ctx:           ctx,
-		userMap:       make(map[string]*protocol.MemoryUser),
+		emailIndex:    make(map[string]int),
+		updateCh:      make(chan struct{}, 1),
+		stopCh:        make(chan struct{}),
+		debounce:      200 * time.Millisecond,
 	}
 
-	// Build user map from config
+	// Build users from config
 	for _, user := range config.Users {
 		if user.Account == nil {
 			continue
@@ -82,13 +92,17 @@ func NewServer(ctx context.Context, config *ServerConfig) (*Inbound, error) {
 			return nil, errors.New("Failed to parse account").Base(err)
 		}
 
-		if hy2Account, ok := memAccount.(*MemoryAccount); ok {
+		if acc, ok := memAccount.(*MemoryAccount); ok {
 			memUser := &protocol.MemoryUser{
 				Email:   user.Email,
 				Level:   user.Level,
 				Account: memAccount,
 			}
-			inbound.userMap[hy2Account.Password] = memUser
+			inbound.userMap.Store(memUser.Email, memUser)
+			// initialize fast-path lists
+			inbound.userList = append(inbound.userList, memUser.Email)
+			inbound.passwordList = append(inbound.passwordList, acc.Password)
+			inbound.emailIndex[memUser.Email] = len(inbound.userList) - 1
 		}
 	}
 
@@ -224,22 +238,12 @@ func (i *Inbound) StartService(ctx context.Context, tag string, packetConn gonet
 		return errors.New("Failed to create Hysteria2 service").Base(err)
 	}
 
-	// Update users with passwords from userMap
-	if len(i.userMap) > 0 {
-		userList := make([]string, 0, len(i.userMap))
-		passwordList := make([]string, 0, len(i.userMap))
-
-		for password, user := range i.userMap {
-			userList = append(userList, user.Email)
-			passwordList = append(passwordList, password)
-		}
-
-		service.UpdateUsers(userList, passwordList)
-		errors.LogInfo(ctx, "Loaded ", len(i.userMap), " Hysteria2 users")
-	} else {
-		// No users configured, use empty list (will reject all connections)
-		errors.LogWarning(ctx, "No users configured for Hysteria2")
-	}
+	// Initialize users into service from fast-path lists
+	i.uMu.RLock()
+	initUsers := append([]string(nil), i.userList...)
+	initPwds := append([]string(nil), i.passwordList...)
+	i.uMu.RUnlock()
+	service.UpdateUsers(initUsers, initPwds)
 
 	i.service = service
 
@@ -250,12 +254,19 @@ func (i *Inbound) StartService(ctx context.Context, tag string, packetConn gonet
 		}
 	}()
 
+	// Start coalesced user updater loop
+	go i.userUpdaterLoop()
+
 	errors.LogInfo(ctx, "Hysteria2 service started")
 	return nil
 }
 
 // Close closes the Hysteria2 service
 func (i *Inbound) Close() error {
+	if i.stopCh != nil {
+		close(i.stopCh)
+		i.stopCh = nil
+	}
 	if i.cancel != nil {
 		i.cancel()
 	}
@@ -288,22 +299,16 @@ func (i *Inbound) NewConnectionEx(ctx context.Context, conn gonet.Conn, source M
 		defer onClose(errors.New("connection closed"))
 	}
 
-	// Get user from auth context
+	// Get user from auth context (hot path: use RLock)
 	var user *protocol.MemoryUser
 	if userID, ok := auth.UserFromContext[string](ctx); ok && userID != "" {
-		if foundUser, exists := i.userMap[userID]; exists {
-			user = foundUser
-		} else {
-			user = &protocol.MemoryUser{
-				Email: userID,
-				Level: 0,
-			}
+		if u, exists := i.userMap.Load(userID); exists {
+			user = u.(*protocol.MemoryUser)
 		}
-	} else {
-		user = &protocol.MemoryUser{
-			Email: "anonymous",
-			Level: 0,
-		}
+	}
+	email := ""
+	if user != nil {
+		email = user.Email
 	}
 
 	// Build session inbound with tag
@@ -336,13 +341,17 @@ func (i *Inbound) NewConnectionEx(ctx context.Context, conn gonet.Conn, source M
 		From:   source,
 		To:     targetDest,
 		Status: log.AccessAccepted,
-		Email:  user.Email,
+		Email:  email,
 	})
 
-	errors.LogInfo(sessionCtx, "accepted hysteria2 tcp connection to ", targetDest, " user: ", user.Email)
+	errors.LogInfo(sessionCtx, "accepted hysteria2 tcp connection to ", targetDest, " user: ", email)
 
 	// Get dispatcher from context or core
 	dispatcher := session.DispatcherFromContext(sessionCtx)
+	if dispatcher == nil {
+		errors.LogWarning(sessionCtx, "dispatcher missing in context")
+		return
+	}
 
 	// Dispatch connection
 	link, err := dispatcher.Dispatch(sessionCtx, targetDest)
@@ -376,22 +385,16 @@ func (i *Inbound) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, 
 		defer onClose(errors.New("connection closed"))
 	}
 
-	// Get user from auth context
+	// Get user from auth context (hot path: use RLock)
 	var user *protocol.MemoryUser
 	if userID, ok := auth.UserFromContext[string](ctx); ok && userID != "" {
-		if foundUser, exists := i.userMap[userID]; exists {
-			user = foundUser
-		} else {
-			user = &protocol.MemoryUser{
-				Email: userID,
-				Level: 0,
-			}
+		if u, exists := i.userMap.Load(userID); exists {
+			user = u.(*protocol.MemoryUser)
 		}
-	} else {
-		user = &protocol.MemoryUser{
-			Email: "anonymous",
-			Level: 0,
-		}
+	}
+	email := ""
+	if user != nil {
+		email = user.Email
 	}
 
 	// Build session inbound with tag
@@ -423,13 +426,17 @@ func (i *Inbound) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, 
 		From:   inbound.Source,
 		To:     targetDest,
 		Status: log.AccessAccepted,
-		Email:  user.Email,
+		Email:  email,
 	})
 
-	errors.LogInfo(sessionCtx, "accepted hysteria2 udp connection to ", targetDest, " user: ", user.Email)
+	errors.LogInfo(sessionCtx, "accepted hysteria2 udp connection to ", targetDest, " user: ", email)
 
 	// Get dispatcher from context or core
 	dispatcher := session.DispatcherFromContext(sessionCtx)
+	if dispatcher == nil {
+		errors.LogWarning(sessionCtx, "dispatcher missing in context")
+		return
+	}
 
 	// Dispatch UDP connection
 	link, err := dispatcher.Dispatch(sessionCtx, targetDest)
@@ -451,52 +458,39 @@ func (i *Inbound) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, 
 	}
 }
 
-// updateServiceUsers updates the hysteria2 service with current user list
+// Update service Users
 func (i *Inbound) updateServiceUsers() {
 	if i.service == nil {
 		return
 	}
-
-	userList := make([]string, 0, len(i.users))
-	passwordList := make([]string, 0, len(i.users))
-
-	for _, user := range i.users {
-		if hy2Account, ok := user.Account.(*MemoryAccount); ok {
-			userList = append(userList, user.Email)
-			passwordList = append(passwordList, hy2Account.Password)
-		}
-	}
-
-	i.service.UpdateUsers(userList, passwordList)
+	// snapshot lists to avoid holding lock during service update
+	i.uMu.RLock()
+	users := append([]string(nil), i.userList...)
+	pwds := append([]string(nil), i.passwordList...)
+	i.uMu.RUnlock()
+	i.service.UpdateUsers(users, pwds)
 }
 
 // AddUser implements proxy.UserManager.AddUser().
 func (i *Inbound) AddUser(ctx context.Context, u *protocol.MemoryUser) error {
-	i.Lock()
-	defer i.Unlock()
-
-	if u.Email != "" {
-		for _, user := range i.users {
-			if user.Email == u.Email {
-				return errors.New("User ", u.Email, " already exists.")
-			}
+	i.userMap.Store(u.Email, u)
+	// update fast-path lists and coalesce service update
+	if acc, ok := u.Account.(*MemoryAccount); ok {
+		i.uMu.Lock()
+		if _, exists := i.emailIndex[u.Email]; !exists {
+			i.userList = append(i.userList, u.Email)
+			i.passwordList = append(i.passwordList, acc.Password)
+			i.emailIndex[u.Email] = len(i.userList) - 1
+		} else {
+			// overwrite password if changed
+			i.passwordList[i.emailIndex[u.Email]] = acc.Password
 		}
+		i.uMu.Unlock()
+		i.scheduleUserUpdate()
+	} else {
+		// fallback: rebuild from map once
+		i.scheduleUserUpdate()
 	}
-
-	// Validate account type
-	hy2Account, ok := u.Account.(*MemoryAccount)
-	if !ok {
-		return errors.New("Invalid account type for Hysteria2")
-	}
-
-	// Add to users list and userMap
-	i.users = append(i.users, u)
-	i.userMap[hy2Account.Password] = u
-
-	// Update service
-	i.updateServiceUsers()
-
-	errors.LogInfo(ctx, "Hysteria2: Added user ", u.Email)
 	return nil
 }
 
@@ -505,41 +499,23 @@ func (i *Inbound) RemoveUser(ctx context.Context, email string) error {
 	if email == "" {
 		return errors.New("Email must not be empty.")
 	}
-
-	i.Lock()
-	defer i.Unlock()
-
-	idx := -1
-	var password string
-	for ii, u := range i.users {
-		if strings.EqualFold(u.Email, email) {
-			idx = ii
-			if hy2Account, ok := u.Account.(*MemoryAccount); ok {
-				password = hy2Account.Password
-			}
-			break
+	i.userMap.Delete(email)
+	// swap-delete in arrays for O(1)
+	i.uMu.Lock()
+	if idx, ok := i.emailIndex[email]; ok {
+		last := len(i.userList) - 1
+		if idx != last {
+			i.userList[idx] = i.userList[last]
+			i.passwordList[idx] = i.passwordList[last]
+			i.emailIndex[i.userList[idx]] = idx
 		}
+		i.userList = i.userList[:last]
+		i.passwordList = i.passwordList[:last]
+		delete(i.emailIndex, email)
 	}
+	i.uMu.Unlock()
+	i.scheduleUserUpdate()
 
-	if idx == -1 {
-		return errors.New("User ", email, " not found.")
-	}
-
-	// Remove from users list
-	ulen := len(i.users)
-	i.users[idx] = i.users[ulen-1]
-	i.users[ulen-1] = nil
-	i.users = i.users[:ulen-1]
-
-	// Remove from userMap
-	if password != "" {
-		delete(i.userMap, password)
-	}
-
-	// Update service
-	i.updateServiceUsers()
-
-	errors.LogInfo(ctx, "Hysteria2: Removed user ", email)
 	return nil
 }
 
@@ -548,32 +524,71 @@ func (i *Inbound) GetUser(ctx context.Context, email string) *protocol.MemoryUse
 	if email == "" {
 		return nil
 	}
-
-	i.Lock()
-	defer i.Unlock()
-
-	for _, u := range i.users {
-		if strings.EqualFold(u.Email, email) {
-			return u
-		}
+	if u, exists := i.userMap.Load(email); exists {
+		return u.(*protocol.MemoryUser)
 	}
 	return nil
 }
 
 // GetUsers implements proxy.UserManager.GetUsers().
 func (i *Inbound) GetUsers(ctx context.Context) []*protocol.MemoryUser {
-	i.Lock()
-	defer i.Unlock()
-
-	dst := make([]*protocol.MemoryUser, len(i.users))
-	copy(dst, i.users)
-	return dst
+	var users []*protocol.MemoryUser
+	i.userMap.Range(func(key, value any) bool {
+		users = append(users, value.(*protocol.MemoryUser))
+		return true
+	})
+	return users
 }
 
 // GetUsersCount implements proxy.UserManager.GetUsersCount().
 func (i *Inbound) GetUsersCount(ctx context.Context) int64 {
-	i.Lock()
-	defer i.Unlock()
+	var count int64
+	i.userMap.Range(func(key, value any) bool {
+		count++
+		return true
+	})
+	return count
+}
 
-	return int64(len(i.users))
+// scheduleUserUpdate coalesces UpdateUsers calls to reduce overhead during bulk updates.
+func (i *Inbound) scheduleUserUpdate() {
+	// try send signal (droppable if already pending)
+	select {
+	case i.updateCh <- struct{}{}:
+	default:
+	}
+}
+
+// userUpdaterLoop batches rapid user updates with a trailing-edge debounce window.
+func (i *Inbound) userUpdaterLoop() {
+	var timer *time.Timer
+	for {
+		var timerC <-chan time.Time
+		if timer != nil {
+			timerC = timer.C
+		}
+		select {
+		case <-i.stopCh:
+			if timer != nil {
+				timer.Stop()
+			}
+			return
+		case <-i.updateCh:
+			if timer == nil {
+				timer = time.NewTimer(i.debounce)
+			} else {
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				timer.Reset(i.debounce)
+			}
+		case <-timerC:
+			timer.Stop()
+			timer = nil
+			i.updateServiceUsers()
+		}
+	}
 }
