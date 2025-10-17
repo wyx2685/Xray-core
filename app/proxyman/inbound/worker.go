@@ -578,3 +578,67 @@ func IsLocal(ip net.IP) bool {
 	}
 	return false
 }
+
+// hysteria2Worker is a special worker for Hysteria2 protocol
+// It uses transport layer's listener instead of standard UDP worker
+type hysteria2Worker struct {
+	tag             string
+	proxy           proxy.Inbound
+	address         net.Address
+	port            net.Port
+	dispatcher      routing.Dispatcher
+	sniffingConfig  *proxyman.SniffingConfig
+	uplinkCounter   stats.Counter
+	downlinkCounter stats.Counter
+	stream          *internet.MemoryStreamConfig
+
+	hub internet.Listener
+
+	ctx context.Context
+}
+
+func (w *hysteria2Worker) Start() error {
+	ctx := w.ctx
+	// Put dispatcher into context so Hysteria2 callbacks can retrieve it via session.DispatcherFromContext
+	ctx = session.ContextWithDispatcher(ctx, w.dispatcher)
+	ctx = context.WithValue(ctx, "xray_proxy_inbound", w.proxy)
+	ctx = context.WithValue(ctx, "inbound_tag", w.tag)
+	sid := session.NewID()
+	ctx = c.ContextWithID(ctx, sid)
+
+	// The hysteria2 transport listener is registered in transport/internet/hysteria2/hub.go
+	// It will be called through the protocol name in streamSettings
+	// We use nil as handler because Hysteria2 handles connections through ServerHandler callbacks
+	hub, err := internet.ListenTCP(ctx, w.address, w.port, w.stream, nil)
+	if err != nil {
+		return errors.New("failed to listen Hysteria2 on ", w.port).AtWarning().Base(err)
+	}
+	w.hub = hub
+	// Note: Hysteria2 handles connections internally through ServerHandler callbacks
+	// No need to call Accept() or handle connections here
+	return nil
+}
+
+func (w *hysteria2Worker) Close() error {
+	var errs []interface{}
+	if w.hub != nil {
+		if err := common.Close(w.hub); err != nil {
+			errs = append(errs, err)
+		}
+		if err := common.Close(w.proxy); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if len(errs) > 0 {
+		return errors.New("failed to close all resources").Base(errors.New(serial.Concat(errs...)))
+	}
+	return nil
+}
+
+func (w *hysteria2Worker) Port() net.Port {
+	return w.port
+}
+
+func (w *hysteria2Worker) Proxy() proxy.Inbound {
+	return w.proxy
+}

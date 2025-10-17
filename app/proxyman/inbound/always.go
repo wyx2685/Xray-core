@@ -113,6 +113,26 @@ func NewAlwaysOnInboundHandler(ctx context.Context, tag string, receiverConfig *
 	if pl != nil {
 		for _, pr := range pl.Range {
 			for port := pr.From; port <= pr.To; port++ {
+				// Special handling for Hysteria2: use transport layer listener instead of standard UDP worker
+				if mss.ProtocolName == "hysteria2" && net.HasNetwork(nl, net.Network_UDP) {
+					errors.LogDebug(ctx, "creating Hysteria2 worker on ", address, ":", port)
+
+					worker := &hysteria2Worker{
+						tag:             tag,
+						proxy:           p,
+						address:         address,
+						port:            net.Port(port),
+						dispatcher:      h.mux,
+						sniffingConfig:  receiverConfig.SniffingSettings,
+						uplinkCounter:   uplinkCounter,
+						downlinkCounter: downlinkCounter,
+						stream:          mss,
+						ctx:             ctx,
+					}
+					h.workers = append(h.workers, worker)
+					continue
+				}
+
 				if net.HasNetwork(nl, net.Network_TCP) {
 					errors.LogDebug(ctx, "creating stream worker on ", address, ":", port)
 

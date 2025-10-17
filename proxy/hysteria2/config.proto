@@ -1,0 +1,82 @@
+syntax = "proto3";
+
+package xray.proxy.hysteria2;
+option csharp_namespace = "Xray.Proxy.Hysteria2";
+option go_package = "github.com/xtls/xray-core/proxy/hysteria2";
+option java_package = "com.xray.proxy.hysteria2";
+option java_multiple_files = true;
+
+import "common/protocol/user.proto";
+import "common/protocol/server_spec.proto";
+
+// Account contains user-specific settings
+message Account {
+  // User password for authentication
+  string password = 1;
+}
+
+// Obfuscation settings for QUIC traffic
+message Obfs {
+  // Obfuscation type, only "salamander" is supported
+  string type = 1;
+  // Obfuscation password
+  string password = 2;
+}
+
+// Masquerade settings for HTTP3 server
+message Masquerade {
+  // Masquerade type: "file", "proxy", "string"
+  string type = 1;
+  
+  // For type "file": root directory for file server
+  string directory = 2;
+  
+  // For type "proxy": reverse proxy target URL
+  string url = 3;
+  // For type "proxy": rewrite Host header to target URL
+  bool rewrite_host = 4;
+  
+  // For type "string": HTTP status code
+  uint32 status_code = 5;
+  // For type "string": HTTP headers
+  map<string, string> headers = 6;
+  // For type "string": HTTP response content
+  string content = 7;
+  
+  // Simple string mode: if masquerade is just a URL string
+  // For backward compatibility
+  string simple_config = 8;
+}
+
+message ClientConfig {
+  repeated xray.common.protocol.ServerEndpoint server = 1;
+}
+
+message ServerConfig {
+  // List of users with their credentials
+  repeated xray.common.protocol.User users = 1;
+  
+  // Packet encoding type: 0 = None, 1 = Packet
+  uint32 packet_encoding = 2;
+  
+  // Bandwidth control (mbps)
+  // Conflicts with ignore_client_bandwidth if both are set
+  uint64 up_mbps = 3;
+  uint64 down_mbps = 4;
+  
+  // QUIC traffic obfuscation
+  Obfs obfs = 5;
+  
+  // Ignore client bandwidth and use server settings
+  // When up_mbps and down_mbps are not set: 
+  //   Force client to use BBR instead of Hysteria CC
+  // When up_mbps and down_mbps are set:
+  //   Prevent client from using BBR
+  bool ignore_client_bandwidth = 6;
+  
+  // HTTP3 server masquerade behavior on authentication failure
+  Masquerade masquerade = 7;
+  
+  // Enable Hysteria Brutal CC debug logging
+  bool brutal_debug = 8;
+}
