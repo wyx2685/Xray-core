@@ -1,0 +1,55 @@
+syntax = "proto3";
+
+package xray.proxy.tuic;
+option csharp_namespace = "Xray.Proxy.Tuic";
+option go_package = "github.com/xtls/xray-core/proxy/tuic";
+option java_package = "com.xray.proxy.tuic";
+option java_multiple_files = true;
+
+import "common/protocol/user.proto";
+import "common/protocol/server_spec.proto";
+
+// Account contains user-specific settings for TUIC protocol
+message Account {
+  // User UUID for authentication
+  string uuid = 1;
+  // User password for authentication  
+  string password = 2;
+}
+
+message ClientConfig {
+  // List of server endpoints
+  repeated xray.common.protocol.ServerEndpoint server = 1;
+  
+  // Congestion control algorithm: "cubic", "new_reno", "bbr"
+  string congestion_control = 2;
+  
+  // Whether to use UDP stream mode instead of datagram mode
+  bool udp_stream = 3;
+  
+  // Enable 0-RTT handshake
+  bool zero_rtt_handshake = 4;
+  
+  // Heartbeat interval in seconds
+  uint32 heartbeat = 5;
+}
+
+message ServerConfig {
+  // List of users with their credentials
+  repeated xray.common.protocol.User users = 1;
+  
+  // Congestion control algorithm: "cubic", "new_reno", "bbr"
+  string congestion_control = 2;
+  
+  // Authentication timeout in seconds
+  uint32 auth_timeout = 3;
+  
+  // Enable 0-RTT handshake
+  bool zero_rtt_handshake = 4;
+  
+  // Heartbeat interval in seconds
+  uint32 heartbeat = 5;
+  
+  // UDP timeout in seconds
+  uint32 udp_timeout = 6;
+}

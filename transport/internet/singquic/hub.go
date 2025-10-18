@@ -1,20 +1,26 @@
-package hysteria2
+package singquic
 
 import (
 	"context"
+	"crypto/tls"
 	gonet "net"
 
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/net"
-	hy2proxy "github.com/xtls/xray-core/proxy/hysteria2"
 	"github.com/xtls/xray-core/transport/internet"
 	xtls "github.com/xtls/xray-core/transport/internet/tls"
 )
 
-// Listener implements internet.Listener for Hysteria2 protocol
+// QuicInbound defines the interface that QUIC-based proxy inbounds must implement
+type QuicInbound interface {
+	StartService(ctx context.Context, tag string, packetConn gonet.PacketConn, tlsConfig *tls.Config) error
+	Close() error
+}
+
+// Listener implements internet.Listener for QUIC-based protocols
 type Listener struct {
-	proxyInbound *hy2proxy.Inbound
+	proxyInbound QuicInbound
 	rawConn      gonet.PacketConn
 	ctx          context.Context
 	cancel       context.CancelFunc
@@ -34,27 +40,35 @@ func (l *Listener) Close() error {
 	return l.rawConn.Close()
 }
 
-// Listen creates a new Hysteria2 listener
-func Listen(ctx context.Context, address net.Address, port net.Port, streamSettings *internet.MemoryStreamConfig, handler internet.ConnHandler) (internet.Listener, error) {
+// Listen creates a new QUIC-based protocol listener
+// This is a generic implementation for all QUIC-based protocols (Hysteria2, TUIC, etc.)
+func Listen(
+	ctx context.Context,
+	address net.Address,
+	port net.Port,
+	streamSettings *internet.MemoryStreamConfig,
+	handler internet.ConnHandler,
+	protocolName string,
+) (internet.Listener, error) {
 	if streamSettings == nil || streamSettings.SecuritySettings == nil {
-		return nil, errors.New("Hysteria2 requires TLS")
+		return nil, errors.New(protocolName, " requires TLS")
 	}
 
 	tlsConfig, ok := streamSettings.SecuritySettings.(*xtls.Config)
 	if !ok || tlsConfig == nil {
-		return nil, errors.New("Hysteria2 requires TLS configuration")
+		return nil, errors.New(protocolName, " requires TLS configuration")
 	}
 
 	// Get proxy inbound from context
-	var proxyInbound *hy2proxy.Inbound
+	var proxyInbound QuicInbound
 	if v := ctx.Value("xray_proxy_inbound"); v != nil {
-		if inbound, ok := v.(*hy2proxy.Inbound); ok {
+		if inbound, ok := v.(QuicInbound); ok {
 			proxyInbound = inbound
 		}
 	}
 
 	if proxyInbound == nil {
-		return nil, errors.New("Hysteria2 requires proxy.Inbound from context")
+		return nil, errors.New(protocolName, " requires proxy.Inbound from context")
 	}
 
 	var tag string
@@ -77,7 +91,7 @@ func Listen(ctx context.Context, address net.Address, port net.Port, streamSetti
 	serverTLSConfig := tlsConfig.GetTLSConfig(xtls.WithNextProto("h3"))
 	if serverTLSConfig == nil {
 		udpConn.Close()
-		return nil, errors.New("Failed to get TLS config")
+		return nil, errors.New("Failed to get TLS config for ", protocolName)
 	}
 
 	// Create listener context
@@ -87,10 +101,10 @@ func Listen(ctx context.Context, address net.Address, port net.Port, streamSetti
 	if err := proxyInbound.StartService(ctx, tag, udpConn, serverTLSConfig); err != nil {
 		cancel()
 		udpConn.Close()
-		return nil, errors.New("Failed to start Hysteria2 service").Base(err)
+		return nil, errors.New("Failed to start ", protocolName, " service").Base(err)
 	}
 
-	errors.LogInfo(ctx, "Hysteria2 server listening on ", address, ":", port)
+	errors.LogInfo(ctx, protocolName, " server listening on ", address, ":", port)
 
 	listener := &Listener{
 		proxyInbound: proxyInbound,
@@ -102,6 +116,15 @@ func Listen(ctx context.Context, address net.Address, port net.Port, streamSetti
 	return listener, nil
 }
 
+// listenerCreator creates a listener for a specific protocol name
+func listenerCreator(protocolName string) internet.ListenFunc {
+	return func(ctx context.Context, address net.Address, port net.Port, streamSettings *internet.MemoryStreamConfig, handler internet.ConnHandler) (internet.Listener, error) {
+		return Listen(ctx, address, port, streamSettings, handler, protocolName)
+	}
+}
+
 func init() {
-	common.Must(internet.RegisterTransportListener(protocolName, Listen))
+	// Register transport listeners for sing-quic based protocols
+	common.Must(internet.RegisterTransportListener(ProtocolNameHysteria2, listenerCreator(ProtocolNameHysteria2)))
+	common.Must(internet.RegisterTransportListener(ProtocolNameTUIC, listenerCreator(ProtocolNameTUIC)))
 }

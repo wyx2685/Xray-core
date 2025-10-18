@@ -31,6 +31,7 @@ var (
 		"trojan":        func() interface{} { return new(TrojanServerConfig) },
 		"wireguard":     func() interface{} { return &WireGuardConfig{IsClient: false} },
 		"hysteria2":     func() interface{} { return new(Hysteria2ServerConfig) },
+		"tuic":          func() interface{} { return new(TuicServerConfig) },
 	}, "protocol", "settings")
 
 	outboundConfigLoader = NewJSONConfigLoader(ConfigCreatorCache{
@@ -48,6 +49,7 @@ var (
 		"dns":         func() interface{} { return new(DNSOutboundConfig) },
 		"wireguard":   func() interface{} { return &WireGuardConfig{IsClient: true} },
 		"hysteria2":   func() interface{} { return new(Hysteria2ClientConfig) },
+		"tuic":        func() interface{} { return new(TuicClientConfig) },
 	}, "protocol", "settings")
 
 	ctllog = log.New(os.Stderr, "xctl> ", 0)

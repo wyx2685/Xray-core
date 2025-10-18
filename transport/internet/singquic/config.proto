@@ -1,0 +1,12 @@
+syntax = "proto3";
+
+package xray.transport.internet.singquic;
+option csharp_namespace = "Xray.Transport.Internet.Singquic";
+option go_package = "github.com/xtls/xray-core/transport/internet/singquic";
+option java_package = "com.xray.transport.internet.singquic";
+option java_multiple_files = true;
+
+// Config for sing-quic based transports (Hysteria2, TUIC, etc.)
+// This is a placeholder config since actual configuration is handled at the proxy layer
+message Config {
+}

@@ -606,7 +606,7 @@ func (w *hysteria2Worker) Start() error {
 	sid := session.NewID()
 	ctx = c.ContextWithID(ctx, sid)
 
-	// The hysteria2 transport listener is registered in transport/internet/hysteria2/hub.go
+	// The hysteria2 transport listener is registered in transport/internet/singquic/hub.go
 	// It will be called through the protocol name in streamSettings
 	// We use nil as handler because Hysteria2 handles connections through ServerHandler callbacks
 	hub, err := internet.ListenTCP(ctx, w.address, w.port, w.stream, nil)
@@ -640,5 +640,68 @@ func (w *hysteria2Worker) Port() net.Port {
 }
 
 func (w *hysteria2Worker) Proxy() proxy.Inbound {
+	return w.proxy
+}
+
+// tuicWorker is a worker for TUIC inbound
+type tuicWorker struct {
+	tag             string
+	proxy           proxy.Inbound
+	address         net.Address
+	port            net.Port
+	dispatcher      routing.Dispatcher
+	sniffingConfig  *proxyman.SniffingConfig
+	uplinkCounter   stats.Counter
+	downlinkCounter stats.Counter
+	stream          *internet.MemoryStreamConfig
+
+	hub internet.Listener
+
+	ctx context.Context
+}
+
+func (w *tuicWorker) Start() error {
+	ctx := w.ctx
+	// Put dispatcher into context so TUIC callbacks can retrieve it via session.DispatcherFromContext
+	ctx = session.ContextWithDispatcher(ctx, w.dispatcher)
+	ctx = context.WithValue(ctx, "xray_proxy_inbound", w.proxy)
+	ctx = context.WithValue(ctx, "inbound_tag", w.tag)
+	sid := session.NewID()
+	ctx = c.ContextWithID(ctx, sid)
+
+	// The tuic transport listener is registered in transport/internet/singquic/hub.go
+	// It will be called through the protocol name in streamSettings
+	// We use nil as handler because TUIC handles connections through ServerHandler callbacks
+	hub, err := internet.ListenTCP(ctx, w.address, w.port, w.stream, nil)
+	if err != nil {
+		return errors.New("failed to listen TUIC on ", w.port).AtWarning().Base(err)
+	}
+	w.hub = hub
+	// Note: TUIC handles connections internally through ServerHandler callbacks
+	// No need to call Accept() or handle connections here
+	return nil
+}
+
+func (w *tuicWorker) Close() error {
+	var errs []interface{}
+	if w.hub != nil {
+		if err := common.Close(w.hub); err != nil {
+			errs = append(errs, err)
+		}
+		if err := common.Close(w.proxy); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if len(errs) > 0 {
+		return errors.New("failed to close all resources").Base(errors.New(serial.Concat(errs...)))
+	}
+	return nil
+}
+
+func (w *tuicWorker) Port() net.Port {
+	return w.port
+}
+
+func (w *tuicWorker) Proxy() proxy.Inbound {
 	return w.proxy
 }

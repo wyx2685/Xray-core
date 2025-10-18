@@ -744,6 +744,8 @@ func (p TransportProtocol) Build() (string, error) {
 		return "httpupgrade", nil
 	case "hysteria2":
 		return "hysteria2", nil
+	case "tuic":
+		return "tuic", nil
 	case "h2", "h3", "http":
 		return "", errors.PrintRemovedFeatureError("HTTP transport (without header padding, etc.)", "XHTTP stream-one H2 & H3")
 	case "quic":
