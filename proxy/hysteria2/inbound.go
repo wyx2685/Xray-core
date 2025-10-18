@@ -75,33 +75,11 @@ func NewServer(ctx context.Context, config *ServerConfig) (*Inbound, error) {
 		if user.Account == nil {
 			continue
 		}
-
-		// Get typed message and convert to Account
-		typedAccount, err := user.Account.GetInstance()
-		if err != nil {
-			return nil, errors.New("Failed to get account instance").Base(err)
-		}
-
-		account, ok := typedAccount.(protocol.AsAccount)
-		if !ok {
-			return nil, errors.New("Account does not implement AsAccount interface")
-		}
-
-		memAccount, err := account.AsAccount()
-		if err != nil {
-			return nil, errors.New("Failed to parse account").Base(err)
-		}
-
-		if acc, ok := memAccount.(*MemoryAccount); ok {
-			memUser := &protocol.MemoryUser{
-				Email:   user.Email,
-				Level:   user.Level,
-				Account: memAccount,
-			}
+		if memUser, err := user.ToMemoryUser(); err == nil {
 			inbound.userMap.Store(memUser.Email, memUser)
 			// initialize fast-path lists
 			inbound.userList = append(inbound.userList, memUser.Email)
-			inbound.passwordList = append(inbound.passwordList, acc.Password)
+			inbound.passwordList = append(inbound.passwordList, memUser.Account.(*MemoryAccount).Password)
 			inbound.emailIndex[memUser.Email] = len(inbound.userList) - 1
 		}
 	}
@@ -227,7 +205,7 @@ func (i *Inbound) StartService(ctx context.Context, tag string, packetConn gonet
 		TLSConfig:             singbridge.NewTLSConfig(tlsConfig),
 		UDPDisabled:           false,
 		UDPTimeout:            60 * time.Second,
-		Handler:               i, // Use self as ServerHandler
+		Handler:               i,
 		MasqueradeHandler:     masqueradeHandler,
 	}
 
@@ -344,7 +322,7 @@ func (i *Inbound) NewConnectionEx(ctx context.Context, conn gonet.Conn, source M
 		Email:  email,
 	})
 
-	errors.LogInfo(sessionCtx, "accepted hysteria2 tcp connection to ", targetDest, " user: ", email)
+	errors.LogDebug(sessionCtx, "accepted hysteria2 tcp connection to ", targetDest, " user: ", email)
 
 	// Get dispatcher from context or core
 	dispatcher := session.DispatcherFromContext(sessionCtx)
@@ -429,7 +407,7 @@ func (i *Inbound) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, 
 		Email:  email,
 	})
 
-	errors.LogInfo(sessionCtx, "accepted hysteria2 udp connection to ", targetDest, " user: ", email)
+	errors.LogDebug(sessionCtx, "accepted hysteria2 udp connection to ", targetDest, " user: ", email)
 
 	// Get dispatcher from context or core
 	dispatcher := session.DispatcherFromContext(sessionCtx)
