@@ -1,0 +1,26 @@
+syntax = "proto3";
+
+package xray.proxy.anytls;
+option csharp_namespace = "Xray.Proxy.AnyTLS";
+option go_package = "github.com/xtls/xray-core/proxy/anytls";
+option java_package = "com.xray.proxy.anytls";
+option java_multiple_files = true;
+
+import "common/protocol/user.proto";
+import "common/protocol/server_spec.proto";
+
+// Account: password-based authentication
+message Account {
+  string password = 1; // raw password; server computes sha256
+}
+
+message ServerConfig {
+  repeated xray.common.protocol.User users = 1;
+  // optional server padding scheme string
+  string padding_scheme = 2;
+}
+
+message ClientConfig {
+  repeated xray.common.protocol.ServerEndpoint server = 1;
+  // client options if needed later (keep empty for now)
+}
