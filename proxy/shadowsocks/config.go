@@ -5,8 +5,9 @@ import (
 	"crypto/cipher"
 	"crypto/md5"
 	"crypto/sha1"
-	"google.golang.org/protobuf/proto"
 	"io"
+
+	"google.golang.org/protobuf/proto"
 
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/antireplay"
@@ -106,6 +107,7 @@ func (a *Account) getCipher() (Cipher, error) {
 }
 
 // AsAccount implements protocol.AsAccount.
+// 性能优化：使用分片BloomRing替代单一BloomRing，减少锁争用
 func (a *Account) AsAccount() (protocol.Account, error) {
 	Cipher, err := a.getCipher()
 	if err != nil {
@@ -118,7 +120,9 @@ func (a *Account) AsAccount() (protocol.Account, error) {
 		Password:   a.Password,
 		replayFilter: func() antireplay.GeneralizedReplayFilter {
 			if a.IvCheck {
-				return antireplay.NewBloomRing()
+				// 优化：使用分片BloomRing（64分片）替代单一BloomRing
+				// 在高并发场景下可将锁争用降低到原来的1/64
+				return antireplay.NewDefaultShardedBloomRing()
 			}
 			return nil
 		}(),
