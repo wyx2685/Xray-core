@@ -17,6 +17,10 @@ const (
 	// - 性能最优：O(实际在线数) vs O(总用户数)，提升5-150倍
 	// - 避免LRU淘汰：确保所有活跃用户都能命中第二级缓存
 	maxSuccessUsers = 0 // 0表示无上限
+
+	// NAT检测阈值：同IP用户数超过此值时，认为是NAT场景，禁用该IP的第一级缓存
+	// 设计原则：家庭网络通常2-8用户，企业小团队10-20用户，大型NAT网关可达数百用户
+	natDetectionThreshold = 30 // 超过30用户认为是大型NAT，禁用第一级缓存
 ) // UserCache 两级用户缓存系统，专门优化IP变化场景
 // 设计思路：
 // 1. 第一级缓存：IP → 用户（处理固定IP场景，O(1)查找）
@@ -48,7 +52,7 @@ type successUserEntry struct {
 	lastAccess int64 // 最后访问时间
 }
 
-// userCacheShard 单个缓存分片
+// userCacheShard 单个缓存分片（支持同IP多用户）
 type userCacheShard struct {
 	mu    sync.RWMutex
 	cache map[string]*cacheEntry // key: "ip:port"
@@ -56,11 +60,12 @@ type userCacheShard struct {
 	cap   int                    // 每个分片的容量
 }
 
-// cacheEntry 缓存条目
+// cacheEntry 缓存条目（支持同IP多用户+NAT检测）
 type cacheEntry struct {
-	user       *protocol.MemoryUser
-	node       *cacheNode
-	lastAccess int64 // 最后访问时间（Unix纳秒），用于延迟LRU更新
+	users         []*protocol.MemoryUser // 同IP的多个用户
+	node          *cacheNode
+	lastAccess    int64 // 最后访问时间（Unix纳秒）
+	isNATDisabled bool  // 是否因NAT检测而禁用缓存
 }
 
 // cacheNode LRU链表节点
@@ -117,6 +122,18 @@ func (c *UserCache) Get(key string) *protocol.MemoryUser {
 func (c *UserCache) Put(key string, user *protocol.MemoryUser) {
 	shard := c.getShard(key)
 	shard.put(key, user)
+}
+
+// GetMultiUser 获取同IP的多个用户（新方法）
+func (c *UserCache) GetMultiUser(key string) []*protocol.MemoryUser {
+	shard := c.getShard(key)
+	return shard.getMultiUser(key)
+}
+
+// PutMultiUser 智能放入用户：支持同IP多用户+NAT检测（新方法）
+func (c *UserCache) PutMultiUser(key string, user *protocol.MemoryUser) {
+	shard := c.getShard(key)
+	shard.putMultiUser(key, user)
 }
 
 // Remove 从缓存中移除指定email的用户
@@ -180,23 +197,85 @@ func (s *userCacheShard) get(key string) *protocol.MemoryUser {
 		s.mu.Unlock()
 	}
 
-	return entry.user
+	return nil // 兼容旧接口，返回nil（已废弃，使用GetMultiUser代替）
 }
 
-// put 将用户放入分片缓存
+// getMultiUser 获取同IP的多个用户（新方法）
+func (s *userCacheShard) getMultiUser(key string) []*protocol.MemoryUser {
+	s.mu.RLock()
+	entry, ok := s.cache[key]
+	if !ok {
+		s.mu.RUnlock()
+		return nil
+	}
+
+	// 检查是否因NAT被禁用
+	if entry.isNATDisabled {
+		s.mu.RUnlock()
+		return nil
+	}
+
+	users := make([]*protocol.MemoryUser, len(entry.users))
+	copy(users, entry.users)
+	s.mu.RUnlock()
+
+	// 延迟LRU更新（减少锁竞争）
+	now := time.Now().UnixNano()
+	if now-entry.lastAccess > 5e9 { // 5秒
+		s.mu.Lock()
+		// 双重检查：其他goroutine可能已经更新过了
+		if now-entry.lastAccess > 5e9 {
+			s.list.moveToFront(entry.node)
+			entry.lastAccess = now
+		}
+		s.mu.Unlock()
+	}
+
+	return users
+}
+
+// put 将用户放入分片缓存（兼容旧接口，已废弃）
 func (s *userCacheShard) put(key string, user *protocol.MemoryUser) {
+	s.putMultiUser(key, user)
+}
+
+// putMultiUser 智能放入用户：支持同IP多用户+NAT检测
+func (s *userCacheShard) putMultiUser(key string, user *protocol.MemoryUser) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// 如果已存在，更新并移到头部
+	// 如果已存在，检查用户是否已在列表中
 	if entry, ok := s.cache[key]; ok {
-		entry.user = user
+		// 检查是否因NAT被禁用
+		if entry.isNATDisabled {
+			return // 已禁用，不再缓存
+		}
+
+		// 检查用户是否已存在
+		for i, existUser := range entry.users {
+			if existUser.Email != "" && existUser.Email == user.Email {
+				// 用户已存在，更新位置和时间
+				entry.users[i] = user
+				entry.lastAccess = time.Now().UnixNano()
+				s.list.moveToFront(entry.node)
+				return
+			}
+		}
+
+		// 新用户，添加到列表
+		entry.users = append(entry.users, user)
 		entry.lastAccess = time.Now().UnixNano()
 		s.list.moveToFront(entry.node)
+
+		// NAT检测：用户数过多时禁用缓存
+		if len(entry.users) > natDetectionThreshold {
+			entry.isNATDisabled = true
+			entry.users = nil // 释放内存
+		}
 		return
 	}
 
-	// 如果缓存已满，移除最少使用的条目（尾部）
+	// 新条目：检查缓存容量
 	if s.list.size >= s.cap {
 		tail := s.list.removeTail()
 		if tail != nil {
@@ -207,7 +286,7 @@ func (s *userCacheShard) put(key string, user *protocol.MemoryUser) {
 	// 添加新条目到头部
 	node := s.list.addToFront(key)
 	s.cache[key] = &cacheEntry{
-		user:       user,
+		users:      []*protocol.MemoryUser{user},
 		node:       node,
 		lastAccess: time.Now().UnixNano(),
 	}
@@ -220,9 +299,19 @@ func (s *userCacheShard) removeByEmail(email string) {
 
 	// 遍历缓存，找到匹配的用户
 	for key, entry := range s.cache {
-		if entry.user.Email == email {
-			s.list.remove(entry.node)
-			delete(s.cache, key)
+		// 检查用户列表中是否有匹配的用户
+		for i, user := range entry.users {
+			if user.Email == email {
+				// 移除用户
+				entry.users = append(entry.users[:i], entry.users[i+1:]...)
+
+				// 如果用户列表为空，移除整个条目
+				if len(entry.users) == 0 {
+					s.list.remove(entry.node)
+					delete(s.cache, key)
+				}
+				return
+			}
 		}
 	}
 }
@@ -293,23 +382,23 @@ func (l *cacheList) moveToFront(node *cacheNode) {
 	l.size++
 }
 
-// GetWithFallback 两级缓存查找：IP缓存 → 成功用户缓存
+// GetWithFallback 智能两级缓存查找：支持同IP多用户+NAT检测
 func (c *UserCache) GetWithFallback(key string) (*protocol.MemoryUser, []*protocol.MemoryUser) {
-	// 第一级：尝试IP缓存
-	if user := c.Get(key); user != nil {
-		return user, nil
+	// 尝试第一级多用户缓存
+	if users := c.GetMultiUser(key); len(users) > 0 {
+		return nil, users // 返回同IP的所有用户供验证
 	}
 
-	// 第二级：返回成功用户列表供验证
+	// 第一级缓存miss或已禁用，使用第二级缓存
 	return nil, c.getSuccessUsers()
 }
 
-// PutWithSuccess 将用户加入IP缓存，并更新成功用户缓存
+// PutWithSuccess 智能缓存策略：支持同IP多用户+NAT检测
 func (c *UserCache) PutWithSuccess(key string, user *protocol.MemoryUser) {
-	// 更新第一级缓存
-	c.Put(key, user)
+	// 智能第一级缓存：支持同IP多用户，自动NAT检测
+	c.PutMultiUser(key, user)
 
-	// 更新第二级缓存
+	// 第二级用户缓存：始终更新，这是主要缓存机制
 	c.addSuccessUser(user)
 }
 
@@ -335,7 +424,8 @@ func (c *UserCache) addSuccessUser(user *protocol.MemoryUser) {
 
 	// 检查用户是否已存在，更新访问时间
 	for i, entry := range c.successCache.users {
-		if entry.user == user {
+		// 使用Email作为唯一标识，而不是指针比较
+		if entry.user.Email != "" && entry.user.Email == user.Email {
 			entry.lastAccess = now
 			// 移到前面（LRU）
 			if i > 0 {
