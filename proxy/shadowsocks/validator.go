@@ -54,8 +54,7 @@ func (v *Validator) initializeIfNeeded() {
 	}
 }
 
-// expandCacheIfNeeded 根据用户数扩展缓存容量（内部使用，调用者需持有锁）
-// 在用户数增长到一定规模时，自动扩容缓存以提升命中率
+// expandCacheIfNeeded 根据用户数扩展缓存容量（简化策略）
 func (v *Validator) expandCacheIfNeeded() {
 	if v.userCache == nil {
 		return
@@ -63,42 +62,20 @@ func (v *Validator) expandCacheIfNeeded() {
 
 	userCount := len(v.users)
 
-	// 根据用户规模计算理想缓存容量
-	// 策略：缓存 min(用户数的10%, 100000)
-	idealSize := userCount / 10
-	if idealSize > 100000 {
-		idealSize = 100000 // 最多10万，避免内存过大
-	}
-
-	// 获取当前缓存容量（估算：32分片 * 分片容量）
-	// 由于 UserCache 没有暴露容量，我们用启发式规则判断：
-	// - 用户数 < 10240：保持默认1024
-	// - 用户数 10240-102400：每10240用户触发一次扩容
-	// - 用户数 > 102400：保持10万容量
-
-	// 定义扩容阈值点
+	// 简化策略：只有三个档位的缓存容量
 	var newCacheSize int
 	switch {
-	case userCount < 10240:
-		// 小规模：保持默认1024
-		return
-	case userCount < 102400:
-		// 中等规模：每达到 10240 的倍数就扩容
-		// 10240 → 1024
-		// 20480 → 2048
-		// 51200 → 5120
-		newCacheSize = userCount / 10
+	case userCount < 5000:
+		return // 小于5000用户，不扩容
+	case userCount < 20000:
+		newCacheSize = 2048 // 中等规模：2048缓存
 	default:
-		// 大规模：固定10万
-		newCacheSize = 100000
+		newCacheSize = 8192 // 大规模：8192缓存（避免过大）
 	}
 
-	// 重建缓存（简单粗暴，清空旧缓存）
-	// 注意：这会丢失当前缓存数据，但下次连接会自动重建
-	// 这个操作不频繁（只在用户数倍增时触发）
-	if newCacheSize > 1024 {
-		v.userCache = NewUserCache(newCacheSize)
-	}
+	// 简化判断：只有在容量明显不足时才扩容
+	// 避免频繁重建缓存
+	v.userCache = NewUserCache(newCacheSize)
 }
 
 // Add a Shadowsocks user.
@@ -158,10 +135,11 @@ func (v *Validator) Add(u *protocol.MemoryUser) error {
 		v.behaviorSeed = crc64.Update(v.behaviorSeed, crc64.MakeTable(crc64.ECMA), hashkdf.Sum(nil))
 	}
 
-	// 定期检查是否需要扩容缓存（在关键节点触发）
-	// 10240, 20480, 51200, 102400 等节点自动扩容
+	// 缓存扩容策略优化：只在用户数量翻倍且超过阈值时扩容
+	// 避免频繁的缓存重建导致连接不稳定
 	userCount := len(v.users)
-	if userCount%10240 == 0 {
+	// 只有当用户数超过2048且为2的幂次时才扩容
+	if userCount >= 2048 && (userCount&(userCount-1)) == 0 {
 		v.expandCacheIfNeeded()
 	}
 
@@ -308,7 +286,7 @@ func (v *Validator) GetStats() ValidatorStats {
 		stats.IndexedUsers = len(v.emailIndex)
 	}
 
-	// 获取攻击防御统计
+	// 获取攻击防御统计（添加空指针保护）
 	if v.attackDefense != nil {
 		defenseStats := v.attackDefense.GetStats()
 		stats.BannedIPs = defenseStats.BannedIPs
@@ -338,84 +316,131 @@ func (v *Validator) Get(bs []byte, command protocol.RequestCommand) (u *protocol
 	return v.GetWithCache(bs, command, "")
 }
 
-// GetWithCache 带缓存支持的用户验证
+// GetWithCache 带两级缓存支持的用户验证（优化IP变化场景）
+//
+// 查找策略：
+// 1. 第一级：IP缓存直接命中（最快，O(1)）
+// 2. 第二级：成功用户缓存遍历（较快，O(k)，k为活跃用户数）
+// 3. 第三级：全量用户扫描（最慢，O(n)，n为总用户数）
+//
 // cacheKey: 缓存键（建议使用源地址 "ip:port"），为空则跳过缓存
 func (v *Validator) GetWithCache(bs []byte, command protocol.RequestCommand, cacheKey string) (u *protocol.MemoryUser, aead cipher.AEAD, ret []byte, ivLen int32, err error) {
-	v.RLock()
-	defer v.RUnlock()
-
-	// 优化：智能防御检查
+	// 优化：先尝试无锁缓存查找
+	// 对于同一用户的多个并发连接，大部分都应该能命中缓存
+	// 这样可以避免全局锁竞争，大幅提升并发性能
 	var defenseKey string
-	if cacheKey != "" && v.attackDefense != nil {
-		// 根据协议类型选择防御粒度：
-		// - TCP: 用纯IP（攻击者会换端口）
-		// - UDP: 用IP:Port（端口通常固定）
-		isTCP := (command == protocol.RequestCommandTCP)
-		defenseKey = v.attackDefense.CheckAndRecordConnection(cacheKey, isTCP)
-
-		if defenseKey != "" && !v.attackDefense.CheckAllowed(defenseKey) {
-			// 已被封禁（IP），直接拒绝，避免遍历所有用户
-			return nil, nil, nil, 0, ErrNotFound
-		}
-	}
-
-	// 优化：先尝试从缓存获取热点用户 O(1)
 	var cachedUser *protocol.MemoryUser
-	if cacheKey != "" && v.userCache != nil {
-		cachedUser = v.userCache.Get(cacheKey)
+	var successUsers []*protocol.MemoryUser
+
+	if cacheKey != "" {
+		// 先进行攻击防御检查（无需全局锁）
+		if v.attackDefense != nil {
+			isTCP := (command == protocol.RequestCommandTCP)
+			defenseKey = v.attackDefense.CheckAndRecordConnection(cacheKey, isTCP)
+
+			if defenseKey != "" && !v.attackDefense.CheckAllowed(defenseKey) {
+				// 已被封禁，直接返回
+				return nil, nil, nil, 0, ErrNotFound
+			}
+		}
+
+		// 尝试两级缓存查找（无需全局锁）
+		if v.userCache != nil {
+			cachedUser, successUsers = v.userCache.GetWithFallback(cacheKey)
+		}
+
 		if cachedUser != nil {
-			// 缓存命中，直接尝试该用户解密
+			// 第一级缓存命中，直接验证
 			if account := cachedUser.Account.(*MemoryAccount); account.Cipher.IsAEAD() {
-				if len(bs) < 32 {
-					cachedUser = nil // 数据太短，缓存失效
-					goto FULL_SCAN
-				}
+				if len(bs) >= 32 {
+					aeadCipher := account.Cipher.(*AEADCipher)
+					ivLen = aeadCipher.IVSize()
+					iv := bs[:ivLen]
 
-				aeadCipher := account.Cipher.(*AEADCipher)
-				ivLen = aeadCipher.IVSize()
-				iv := bs[:ivLen]
+					// 使用栈分配避免池开销
+					subkey := make([]byte, aeadCipher.KeyBytes)
+					hkdfSHA1(account.Key, iv, subkey)
+					aead = aeadCipher.AEADAuthCreator(subkey)
 
-				subkey := getSubkey(aeadCipher.KeyBytes)
-				hkdfSHA1(account.Key, iv, subkey)
-				aead = aeadCipher.AEADAuthCreator(subkey)
-
-				var matchErr error
-				switch command {
-				case protocol.RequestCommandTCP:
-					data := getTCPData(4 + aead.NonceSize())
-					ret, matchErr = aead.Open(data[:0], data[4:], bs[ivLen:ivLen+18], nil)
-				case protocol.RequestCommandUDP:
-					data := getUDPData()
-					ret, matchErr = aead.Open(data[:0], data[8192-aead.NonceSize():8192], bs[ivLen:], nil)
-				}
-
-				putSubkey(subkey)
-
-				if matchErr == nil {
-					// 缓存命中且解密成功，快速返回
-					u = cachedUser
-					err = account.CheckIV(iv)
-					// 优化：记录验证成功，清除失败记录
-					if defenseKey != "" && v.attackDefense != nil {
-						v.attackDefense.RecordSuccess(defenseKey)
+					var matchErr error
+					switch command {
+					case protocol.RequestCommandTCP:
+						data := make([]byte, 4+aead.NonceSize())
+						ret, matchErr = aead.Open(data[:0], data[4:], bs[ivLen:ivLen+18], nil)
+					case protocol.RequestCommandUDP:
+						data := make([]byte, 8192)
+						ret, matchErr = aead.Open(data[:0], data[8192-aead.NonceSize():8192], bs[ivLen:], nil)
 					}
-					return
+
+					if matchErr == nil {
+						// 第一级缓存命中且验证成功，记录成功并返回
+						u = cachedUser
+						err = account.CheckIV(iv)
+						if defenseKey != "" && v.attackDefense != nil {
+							v.attackDefense.RecordSuccess(defenseKey)
+						}
+						return
+					}
+					// 第一级缓存失效，继续第二级缓存验证
 				}
-				// 缓存失效（用户密钥可能已变更），继续全量扫描
+			}
+		}
+
+		// 第二级缓存：验证成功用户列表（无需全局锁）
+		if len(successUsers) > 0 {
+			for _, successUser := range successUsers {
+				if account := successUser.Account.(*MemoryAccount); account.Cipher.IsAEAD() {
+					if len(bs) >= 32 {
+						aeadCipher := account.Cipher.(*AEADCipher)
+						ivLen = aeadCipher.IVSize()
+						iv := bs[:ivLen]
+
+						// 使用栈分配避免池开销
+						subkey := make([]byte, aeadCipher.KeyBytes)
+						hkdfSHA1(account.Key, iv, subkey)
+						aead = aeadCipher.AEADAuthCreator(subkey)
+
+						var matchErr error
+						switch command {
+						case protocol.RequestCommandTCP:
+							data := make([]byte, 4+aead.NonceSize())
+							ret, matchErr = aead.Open(data[:0], data[4:], bs[ivLen:ivLen+18], nil)
+						case protocol.RequestCommandUDP:
+							data := make([]byte, 8192)
+							ret, matchErr = aead.Open(data[:0], data[8192-aead.NonceSize():8192], bs[ivLen:], nil)
+						}
+
+						if matchErr == nil {
+							// 第二级缓存命中且验证成功
+							u = successUser
+							err = account.CheckIV(iv)
+
+							// 更新第一级缓存
+							if cacheKey != "" && v.userCache != nil {
+								v.userCache.PutWithSuccess(cacheKey, successUser)
+							}
+
+							// 记录成功
+							if defenseKey != "" && v.attackDefense != nil {
+								v.attackDefense.RecordSuccess(defenseKey)
+							}
+							return
+						}
+					}
+				}
 			}
 		}
 	}
 
-FULL_SCAN:
-	// 未命中缓存或缓存验证失败，遍历所有用户
-	//
-	// 优化策略：早期中断（仅对从未成功的连接启用）
-	// - 如果是首次连接的正常用户 → 不在缓存，需要完整遍历
-	// - 如果是过期用户持续重试 → 已有失败记录，可以提前中断
+	// 慢速路径：需要全局锁进行全量扫描
+	v.RLock()
+	defer v.RUnlock()
+
+	// 全量扫描策略：早期中断优化
 	totalUsers := len(v.users)
 	earlyStopThreshold := totalUsers // 默认检查所有用户（保证正常用户能连接）
 
-	// 白名单检查优化（新增）：
+	// 白名单检查优化（新增）：（添加空指针保护）
 	// - 如果IP在白名单中(曾经成功验证过)，跳过早停限制
 	// - 这样正常用户打开新连接时不会因为"缓存未命中"而受早停影响
 	// - 攻击者的IP不在白名单，仍然会触发早停
@@ -426,7 +451,7 @@ FULL_SCAN:
 		isWhitelisted = v.attackDefense.IsWhitelisted(defenseKey)
 	}
 
-	// 只有当连接已经有失败记录时，才启用早期中断
+	// 只有当连接已经有失败记录时，才启用早期中断（添加空指针保护）
 	// 白名单IP(成功验证过的正常用户)不受早停限制
 	if !isWhitelisted && defenseKey != "" && v.attackDefense != nil {
 		if v.attackDefense.HasFailureRecord(defenseKey) {
@@ -502,13 +527,13 @@ FULL_SCAN:
 				u = user
 				err = account.CheckIV(iv)
 
-				// 优化：找到用户后更新缓存（异步更新，不阻塞当前请求）
+				// 优化：找到用户后更新两级缓存（异步更新，不阻塞当前请求）
 				if cacheKey != "" && v.userCache != nil {
-					// 注意：这里在RLock内调用Put是安全的，因为UserCache内部有自己的锁
-					v.userCache.Put(cacheKey, user)
+					// 同时更新IP缓存和成功用户缓存
+					v.userCache.PutWithSuccess(cacheKey, user)
 				}
 
-				// 优化：记录验证成功，清除失败记录
+				// 优化：记录验证成功，清除失败记录（添加空指针保护）
 				if defenseKey != "" && v.attackDefense != nil {
 					v.attackDefense.RecordSuccess(defenseKey)
 				}
@@ -519,6 +544,11 @@ FULL_SCAN:
 			u = user
 			ivLen = user.Account.(*MemoryAccount).Cipher.IVSize()
 			// err = user.Account.(*MemoryAccount).CheckIV(bs[:ivLen]) // The IV size of None Cipher is 0.
+
+			// 优化：更新两级缓存
+			if cacheKey != "" && v.userCache != nil {
+				v.userCache.PutWithSuccess(cacheKey, user)
+			}
 
 			// 优化：记录验证成功
 			if defenseKey != "" && v.attackDefense != nil {

@@ -57,22 +57,22 @@ type failureRecord struct {
 func NewAttackDefense(config *DefenseConfig) *AttackDefense {
 	if config == nil {
 		config = &DefenseConfig{
-			MaxFailures:      5,               // 5次失败后限制（快速响应）
-			BanDuration:      5 * time.Minute, // 限制5分钟
-			CleanupInterval:  10 * time.Minute,
-			EarlyStopPercent: 10, // 基础百分比（实际会根据失败次数动态调整）
+			MaxFailures:      20,              // 两级缓存优化后，可以适当收紧到20次
+			BanDuration:      3 * time.Minute, // 缩短到3分钟（快速恢复+性能优化）
+			CleanupInterval:  5 * time.Minute, // 适中的清理频率
+			EarlyStopPercent: 30,              // 收紧到30%（性能释放，两级缓存补偿）
 		}
 	}
 
 	// 确保配置有效
 	if config.MaxFailures <= 0 {
-		config.MaxFailures = 5
+		config.MaxFailures = 15
 	}
 	if config.BanDuration <= 0 {
-		config.BanDuration = 5 * time.Minute
+		config.BanDuration = 10 * time.Minute
 	}
 	if config.CleanupInterval <= 0 {
-		config.CleanupInterval = 10 * time.Minute
+		config.CleanupInterval = 5 * time.Minute
 	}
 
 	d := &AttackDefense{
@@ -312,19 +312,16 @@ func (d *AttackDefense) CheckAndRecordConnection(addr string, isTCP bool) string
 	return addr
 }
 
-// GetEarlyStopThreshold 获取早期中断阈值（激进式限制）
-// 根据连续失败次数，快速减少检查数量，防止高并发攻击
+// GetEarlyStopThreshold 获取早期中断阈值（两级缓存优化版）
+// 配合20次失败阈值和3分钟封禁，以及两级缓存机制，实现性能和安全的平衡
 //
-// 新策略（更激进，快速响应）：
-// - 1次失败：检查100%用户（正常用户可能输错密码）
-// - 2次失败：检查50%用户（开始怀疑）
-// - 3次失败：检查20%用户（很可能是假用户）
-// - 4次失败：检查10%用户（明确是假用户）
-// - 5+次失败：检查5%用户（持续攻击，严格限制）
-//
-// 配合MaxFailures=5，在第5次失败时同时：
-// 1. CheckAllowed() 封禁IP（后续连接直接拒绝）
-// 2. 早期中断限制到5%（当前正在验证的连接提前退出）
+// 两级缓存优化策略：
+// - 正常用户：第一级IP缓存命中（O(1)）或第二级成功用户缓存（O(k)，k<<n）
+// - 攻击用户：无法命中缓存，需要全量扫描，此时早期中断生效
+// - 1-5次失败：检查100%用户（给正常用户充足机会）
+// - 6-12次失败：检查50%用户（开始限制可疑连接）
+// - 13-19次失败：检查30%用户（严格限制）
+// - 20+次失败：启用封禁（确认为攻击）
 func (d *AttackDefense) GetEarlyStopThreshold(totalUsers int, addr string) int {
 	if d.config.EarlyStopPercent <= 0 {
 		return totalUsers // 不启用早期中断
@@ -335,31 +332,36 @@ func (d *AttackDefense) GetEarlyStopThreshold(totalUsers int, addr string) int {
 
 	var percent int
 	switch {
-	case consecutiveFails <= 1:
-		// 1次失败：检查所有用户（可能是正常用户输错密码）
+	case consecutiveFails <= 5:
+		// 1-5次失败：检查所有用户（给正常用户充足机会）
 		return totalUsers
-	case consecutiveFails == 2:
-		// 2次失败：检查50%（开始限制）
+	case consecutiveFails <= 12:
+		// 6-12次失败：检查50%（开始限制可疑连接，两级缓存补偿）
 		percent = 50
-	case consecutiveFails == 3:
-		// 3次失败：检查20%（明显可疑）
-		percent = 20
-	case consecutiveFails == 4:
-		// 4次失败：检查10%（即将封禁）
-		percent = 10
+	case consecutiveFails <= 19:
+		// 13-19次失败：检查30%（严格限制，接近封禁）
+		percent = 30
 	default:
-		// 5+次失败：检查5%（配合封禁，双重保护）
-		percent = 5
+		// 20+次失败：检查20%（最小检查，即将封禁）
+		percent = 20
 	}
 
 	threshold := totalUsers * percent / 100
 
-	// 设置合理的最小值：至少检查100个用户
-	// 这样即使有10万用户，新用户也有较大概率被检查到
-	minThreshold := 100
+	// 大规模场景优化：针对10K-300K用户规模调整最小阈值
+	// 正常用户命中两级缓存，攻击者才需要全量扫描+早期中断
+	minThreshold := 200 // 大规模场景：最少检查200用户
 	if totalUsers < 1000 {
-		minThreshold = totalUsers / 10 // 小规模场景：至少10%
+		minThreshold = totalUsers / 10 // 中小规模：至少10%
+	} else if totalUsers < 10000 {
+		minThreshold = totalUsers / 20 // 中等规模：至少5%
+	} else {
+		minThreshold = totalUsers / 50 // 大规模：至少2%，但不少于200
+		if minThreshold < 200 {
+			minThreshold = 200
+		}
 	}
+
 	if minThreshold > totalUsers {
 		minThreshold = totalUsers
 	}

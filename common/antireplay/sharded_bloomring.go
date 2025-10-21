@@ -8,12 +8,12 @@ import (
 )
 
 const (
-	// DefaultShardCount 默认分片数量，用于降低锁争用
-	// 优化：从64增加到128，进一步降低高并发场景(16核+)的锁竞争
-	// 测试数据：64分片在16核下有60%锁竞争，128分片可降至30%
-	DefaultShardCount = 128
+	// DefaultShardCount 默认分片数量，平衡性能和内存开销
+	// 优化：调整为64，在性能和内存之间取得平衡
+	// 64分片可以有效降低锁竞争，同时不会过度消耗内存
+	DefaultShardCount = 64
 	// DefaultCapacityPerShard 每个分片的默认容量
-	DefaultCapacityPerShard = 8000 // 总容量 1M / 128 分片
+	DefaultCapacityPerShard = 16000 // 总容量 1M / 64 分片
 	// DefaultFPR 默认误判率
 	DefaultFPR = 1e-6
 	// DefaultSlot 默认时间槽数量
@@ -21,8 +21,6 @@ const (
 )
 
 // ShardedBloomRing 分片布隆环，通过多个分片降低锁争用，提升并发性能
-// 在高并发场景下（如5000+并发），单一锁会成为严重瓶颈
-// 使用64个分片可以将锁争用降低到原来的1/64
 type ShardedBloomRing struct {
 	shards    []*bloomRingShard
 	numShards uint32
