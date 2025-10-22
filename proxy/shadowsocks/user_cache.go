@@ -18,9 +18,9 @@ const (
 	// - 避免LRU淘汰：确保所有活跃用户都能命中第二级缓存
 	maxSuccessUsers = 0 // 0表示无上限
 
-	// NAT检测阈值：同IP用户数超过此值时，认为是NAT场景，禁用该IP的第一级缓存
-	// 设计原则：家庭网络通常2-8用户，企业小团队10-20用户，大型NAT网关可达数百用户
-	natDetectionThreshold = 30 // 超过30用户认为是大型NAT，禁用第一级缓存
+	// 中转检测阈值：同IP用户数超过此值时，认为是中转场景，禁用该IP的第一级缓存
+	// 设计原则：家庭网络通常2-8用户，超过10个用户大概率是中转节点
+	relayDetectionThreshold = 10 // 超过10用户认为是中转，禁用第一级缓存
 ) // UserCache 两级用户缓存系统，专门优化IP变化场景
 // 设计思路：
 // 1. 第一级缓存：IP → 用户（处理固定IP场景，O(1)查找）
@@ -60,12 +60,12 @@ type userCacheShard struct {
 	cap   int                    // 每个分片的容量
 }
 
-// cacheEntry 缓存条目（支持同IP多用户+NAT检测）
+// cacheEntry 缓存条目（支持同IP多用户+中转检测）
 type cacheEntry struct {
-	users         []*protocol.MemoryUser // 同IP的多个用户
-	node          *cacheNode
-	lastAccess    int64 // 最后访问时间（Unix纳秒）
-	isNATDisabled bool  // 是否因NAT检测而禁用缓存
+	users      []*protocol.MemoryUser // 同IP的多个用户
+	node       *cacheNode
+	lastAccess int64 // 最后访问时间（Unix纳秒）
+	isRelay    bool  // 是否为中转环境（检测到后禁用第一级缓存和攻击防御）
 }
 
 // cacheNode LRU链表节点
@@ -130,7 +130,7 @@ func (c *UserCache) GetMultiUser(key string) []*protocol.MemoryUser {
 	return shard.getMultiUser(key)
 }
 
-// PutMultiUser 智能放入用户：支持同IP多用户+NAT检测（新方法）
+// PutMultiUser 智能放入用户：支持同IP多用户+中转检测（新方法）
 func (c *UserCache) PutMultiUser(key string, user *protocol.MemoryUser) {
 	shard := c.getShard(key)
 	shard.putMultiUser(key, user)
@@ -209,8 +209,8 @@ func (s *userCacheShard) getMultiUser(key string) []*protocol.MemoryUser {
 		return nil
 	}
 
-	// 检查是否因NAT被禁用
-	if entry.isNATDisabled {
+	// 检查是否为中转环境
+	if entry.isRelay {
 		s.mu.RUnlock()
 		return nil
 	}
@@ -239,16 +239,16 @@ func (s *userCacheShard) put(key string, user *protocol.MemoryUser) {
 	s.putMultiUser(key, user)
 }
 
-// putMultiUser 智能放入用户：支持同IP多用户+NAT检测
+// putMultiUser 智能放入用户：支持同IP多用户+中转检测
 func (s *userCacheShard) putMultiUser(key string, user *protocol.MemoryUser) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	// 如果已存在，检查用户是否已在列表中
 	if entry, ok := s.cache[key]; ok {
-		// 检查是否因NAT被禁用
-		if entry.isNATDisabled {
-			return // 已禁用，不再缓存
+		// 检查是否为中转环境
+		if entry.isRelay {
+			return // 已标记为中转，不再缓存
 		}
 
 		// 检查用户是否已存在
@@ -267,9 +267,9 @@ func (s *userCacheShard) putMultiUser(key string, user *protocol.MemoryUser) {
 		entry.lastAccess = time.Now().UnixNano()
 		s.list.moveToFront(entry.node)
 
-		// NAT检测：用户数过多时禁用缓存
-		if len(entry.users) > natDetectionThreshold {
-			entry.isNATDisabled = true
+		// 中转检测：用户数过多时标记为中转环境
+		if len(entry.users) > relayDetectionThreshold {
+			entry.isRelay = true
 			entry.users = nil // 释放内存
 		}
 		return
@@ -382,20 +382,33 @@ func (l *cacheList) moveToFront(node *cacheNode) {
 	l.size++
 }
 
-// GetWithFallback 智能两级缓存查找：支持同IP多用户+NAT检测
-func (c *UserCache) GetWithFallback(key string) (*protocol.MemoryUser, []*protocol.MemoryUser) {
-	// 尝试第一级多用户缓存
-	if users := c.GetMultiUser(key); len(users) > 0 {
-		return nil, users // 返回同IP的所有用户供验证
+// GetWithFallback 智能两级缓存查找：支持同IP多用户+中转检测
+// 返回: (cachedUser, successUsers, isRelay)
+func (c *UserCache) GetWithFallback(key string) (*protocol.MemoryUser, []*protocol.MemoryUser, bool) {
+	// 检查是否为中转环境
+	shard := c.getShard(key)
+	shard.mu.RLock()
+	entry, ok := shard.cache[key]
+	isRelay := ok && entry.isRelay
+	shard.mu.RUnlock()
+
+	// 如果是中转环境，直接返回第二级缓存，同时标记为中转
+	if isRelay {
+		return nil, c.getSuccessUsers(), true
 	}
 
-	// 第一级缓存miss或已禁用，使用第二级缓存
-	return nil, c.getSuccessUsers()
+	// 尝试第一级多用户缓存
+	if users := c.GetMultiUser(key); len(users) > 0 {
+		return nil, users, false // 返回同IP的所有用户供验证
+	}
+
+	// 第一级缓存miss，使用第二级缓存
+	return nil, c.getSuccessUsers(), false
 }
 
-// PutWithSuccess 智能缓存策略：支持同IP多用户+NAT检测
+// PutWithSuccess 智能缓存策略：支持同IP多用户+中转检测
 func (c *UserCache) PutWithSuccess(key string, user *protocol.MemoryUser) {
-	// 智能第一级缓存：支持同IP多用户，自动NAT检测
+	// 智能第一级缓存：支持同IP多用户，自动中转检测
 	c.PutMultiUser(key, user)
 
 	// 第二级用户缓存：始终更新，这是主要缓存机制

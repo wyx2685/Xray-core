@@ -5,10 +5,10 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"hash/crc64"
+	"math/rand/v2"
 	"strings"
 	"sync"
 
-	"github.com/xtls/xray-core/common/dice"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/protocol"
 )
@@ -35,6 +35,8 @@ type Validator struct {
 
 	behaviorSeed  uint64
 	behaviorFused bool
+
+	isRelayNode bool // 标记节点是否处于中转环境（检测到后保持，关闭攻击防御）
 }
 
 var ErrNotFound = errors.New("Not Found")
@@ -333,8 +335,20 @@ func (v *Validator) GetWithCache(bs []byte, command protocol.RequestCommand, cac
 	var successUsers []*protocol.MemoryUser
 
 	if cacheKey != "" {
-		// 先进行攻击防御检查（无需全局锁）
-		if v.attackDefense != nil {
+		// 尝试两级缓存查找（无需全局锁），同时获取是否为中转环境
+		var isRelay bool
+		if v.userCache != nil {
+			cachedUser, successUsers, isRelay = v.userCache.GetWithFallback(cacheKey)
+			// 检测到中转环境，设置全局开关（只设置一次）
+			if isRelay && !v.isRelayNode {
+				v.Lock()
+				v.isRelayNode = true
+				v.Unlock()
+			}
+		}
+
+		// 只有在非中转节点时才进行攻击防御
+		if !v.isRelayNode && v.attackDefense != nil {
 			isTCP := (command == protocol.RequestCommandTCP)
 			defenseKey = v.attackDefense.CheckAndRecordConnection(cacheKey, isTCP)
 
@@ -342,11 +356,6 @@ func (v *Validator) GetWithCache(bs []byte, command protocol.RequestCommand, cac
 				// 已被封禁，直接返回
 				return nil, nil, nil, 0, ErrNotFound
 			}
-		}
-
-		// 尝试两级缓存查找（无需全局锁）
-		if v.userCache != nil {
-			cachedUser, successUsers = v.userCache.GetWithFallback(cacheKey)
 		}
 
 		if cachedUser != nil {
@@ -357,26 +366,34 @@ func (v *Validator) GetWithCache(bs []byte, command protocol.RequestCommand, cac
 					ivLen = aeadCipher.IVSize()
 					iv := bs[:ivLen]
 
-					// 使用栈分配避免池开销
-					subkey := make([]byte, aeadCipher.KeyBytes)
+					// 优化：使用内存池获取subkey缓冲区
+					subkey := getSubkey(aeadCipher.KeyBytes)
 					hkdfSHA1(account.Key, iv, subkey)
 					aead = aeadCipher.AEADAuthCreator(subkey)
 
 					var matchErr error
 					switch command {
 					case protocol.RequestCommandTCP:
-						data := make([]byte, 4+aead.NonceSize())
+						// 优化：使用内存池获取TCP数据缓冲区
+						data := getTCPData(4 + aead.NonceSize())
 						ret, matchErr = aead.Open(data[:0], data[4:], bs[ivLen:ivLen+18], nil)
+						// TCP数据在返回后仍需使用，暂不归还到池
 					case protocol.RequestCommandUDP:
-						data := make([]byte, 8192)
+						// 优化：使用内存池获取UDP数据缓冲区
+						data := getUDPData()
 						ret, matchErr = aead.Open(data[:0], data[8192-aead.NonceSize():8192], bs[ivLen:], nil)
+						// UDP数据在返回后仍需使用，暂不归还到池
 					}
+
+					// 用完立即归还subkey到池
+					putSubkey(subkey)
 
 					if matchErr == nil {
 						// 第一级缓存命中且验证成功，记录成功并返回
 						u = cachedUser
 						err = account.CheckIV(iv)
-						if defenseKey != "" && v.attackDefense != nil {
+						// 非中转节点才记录成功
+						if !v.isRelayNode && defenseKey != "" && v.attackDefense != nil {
 							v.attackDefense.RecordSuccess(defenseKey)
 						}
 						return
@@ -395,20 +412,27 @@ func (v *Validator) GetWithCache(bs []byte, command protocol.RequestCommand, cac
 						ivLen = aeadCipher.IVSize()
 						iv := bs[:ivLen]
 
-						// 使用栈分配避免池开销
-						subkey := make([]byte, aeadCipher.KeyBytes)
+						// 优化：使用内存池获取subkey缓冲区
+						subkey := getSubkey(aeadCipher.KeyBytes)
 						hkdfSHA1(account.Key, iv, subkey)
 						aead = aeadCipher.AEADAuthCreator(subkey)
 
 						var matchErr error
 						switch command {
 						case protocol.RequestCommandTCP:
-							data := make([]byte, 4+aead.NonceSize())
+							// 优化：使用内存池获取TCP数据缓冲区
+							data := getTCPData(4 + aead.NonceSize())
 							ret, matchErr = aead.Open(data[:0], data[4:], bs[ivLen:ivLen+18], nil)
+							// TCP数据在返回后仍需使用，暂不归还到池
 						case protocol.RequestCommandUDP:
-							data := make([]byte, 8192)
+							// 优化：使用内存池获取UDP数据缓冲区
+							data := getUDPData()
 							ret, matchErr = aead.Open(data[:0], data[8192-aead.NonceSize():8192], bs[ivLen:], nil)
+							// UDP数据在返回后仍需使用，暂不归还到池
 						}
+
+						// 用完立即归还subkey到池
+						putSubkey(subkey)
 
 						if matchErr == nil {
 							// 第二级缓存命中且验证成功
@@ -420,8 +444,8 @@ func (v *Validator) GetWithCache(bs []byte, command protocol.RequestCommand, cac
 								v.userCache.PutWithSuccess(cacheKey, successUser)
 							}
 
-							// 记录成功
-							if defenseKey != "" && v.attackDefense != nil {
+							// 非中转节点才记录成功
+							if !v.isRelayNode && defenseKey != "" && v.attackDefense != nil {
 								v.attackDefense.RecordSuccess(defenseKey)
 							}
 							return
@@ -462,19 +486,18 @@ func (v *Validator) GetWithCache(bs []byte, command protocol.RequestCommand, cac
 		// 否则：首次连接，完整遍历，避免误判
 	}
 
-	// 随机起始位置，避免总是遍历前面的用户
-	// 这样可以：
-	// 1. 公平性：所有用户有平等的验证机会
-	// 2. 缓存均衡：不同位置的用户都能被缓存
-	// 3. 防御优化：攻击者位置随机，不会固定消耗前N个检查
+	// 随机起始位置：使用 math/rand/v2（无锁、高性能）
+	// 优势：
+	// 1. 无锁：每个 goroutine 有独立的随机数生成器
+	// 2. 均匀分布：所有用户有平等的验证机会
+	// 3. 性能：比 math/rand 快很多，无全局锁竞争
 	startIdx := 0
 	if totalUsers > 1 {
-		startIdx = dice.Roll(totalUsers)
+		startIdx = rand.IntN(totalUsers)
 	}
 
 	checkedCount := 0
 	for i := 0; i < totalUsers; i++ {
-		// 从随机位置开始，循环遍历
 		idx := (startIdx + i) % totalUsers
 		user := v.users[idx]
 
@@ -533,8 +556,8 @@ func (v *Validator) GetWithCache(bs []byte, command protocol.RequestCommand, cac
 					v.userCache.PutWithSuccess(cacheKey, user)
 				}
 
-				// 优化：记录验证成功，清除失败记录（添加空指针保护）
-				if defenseKey != "" && v.attackDefense != nil {
+				// 非中转节点才记录验证成功（添加空指针保护）
+				if !v.isRelayNode && defenseKey != "" && v.attackDefense != nil {
 					v.attackDefense.RecordSuccess(defenseKey)
 				}
 
@@ -550,16 +573,16 @@ func (v *Validator) GetWithCache(bs []byte, command protocol.RequestCommand, cac
 				v.userCache.PutWithSuccess(cacheKey, user)
 			}
 
-			// 优化：记录验证成功
-			if defenseKey != "" && v.attackDefense != nil {
+			// 非中转节点才记录验证成功
+			if !v.isRelayNode && defenseKey != "" && v.attackDefense != nil {
 				v.attackDefense.RecordSuccess(defenseKey)
 			}
 			return
 		}
 	}
 
-	// 优化：未找到用户，记录失败
-	if defenseKey != "" && v.attackDefense != nil {
+	// 非中转节点才记录失败
+	if !v.isRelayNode && defenseKey != "" && v.attackDefense != nil {
 		v.attackDefense.RecordFailure(defenseKey)
 	}
 
@@ -572,7 +595,7 @@ func (v *Validator) GetBehaviorSeed() uint64 {
 
 	v.behaviorFused = true
 	if v.behaviorSeed == 0 {
-		v.behaviorSeed = dice.RollUint64()
+		v.behaviorSeed = rand.Uint64()
 	}
 	return v.behaviorSeed
 }

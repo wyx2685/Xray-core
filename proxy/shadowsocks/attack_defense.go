@@ -312,15 +312,19 @@ func (d *AttackDefense) CheckAndRecordConnection(addr string, isTCP bool) string
 	return addr
 }
 
-// GetEarlyStopThreshold 获取早期中断阈值（两级缓存优化版）
-// 配合20次失败阈值和3分钟封禁，以及两级缓存机制，实现性能和安全的平衡
+// GetEarlyStopThreshold 获取早期中断阈值（严格防御版）
+// 配合中转检测机制，可以更严格地早期中断
 //
-// 两级缓存优化策略：
+// 中转检测优化：
 // - 正常用户：第一级IP缓存命中（O(1)）或第二级成功用户缓存（O(k)，k<<n）
-// - 攻击用户：无法命中缓存，需要全量扫描，此时早期中断生效
-// - 1-5次失败：检查100%用户（给正常用户充足机会）
-// - 6-12次失败：检查50%用户（开始限制可疑连接）
-// - 13-19次失败：检查30%用户（严格限制）
+// - 中转节点：检测到后直接关闭防御，不受早期中断影响
+// - 攻击用户：无法命中缓存，需要全量扫描，此时严格早期中断生效
+//
+// 严格策略（中转节点已豁免，可以更激进）：
+// - 1-2次失败：检查100%用户（首次容错）
+// - 3-5次失败：检查30%用户（快速限制可疑连接）
+// - 6-10次失败：检查15%用户（严格限制）
+// - 11-19次失败：检查10%用户（最小检查）
 // - 20+次失败：启用封禁（确认为攻击）
 func (d *AttackDefense) GetEarlyStopThreshold(totalUsers int, addr string) int {
 	if d.config.EarlyStopPercent <= 0 {
@@ -332,33 +336,36 @@ func (d *AttackDefense) GetEarlyStopThreshold(totalUsers int, addr string) int {
 
 	var percent int
 	switch {
-	case consecutiveFails <= 5:
-		// 1-5次失败：检查所有用户（给正常用户充足机会）
+	case consecutiveFails <= 2:
+		// 1-2次失败：检查所有用户（首次容错，避免误判）
 		return totalUsers
-	case consecutiveFails <= 12:
-		// 6-12次失败：检查50%（开始限制可疑连接，两级缓存补偿）
-		percent = 50
-	case consecutiveFails <= 19:
-		// 13-19次失败：检查30%（严格限制，接近封禁）
+	case consecutiveFails <= 5:
+		// 3-5次失败：检查30%（快速限制可疑连接）
 		percent = 30
+	case consecutiveFails <= 10:
+		// 6-10次失败：检查15%（严格限制）
+		percent = 15
+	case consecutiveFails <= 19:
+		// 11-19次失败：检查10%（最小检查，接近封禁）
+		percent = 10
 	default:
-		// 20+次失败：检查20%（最小检查，即将封禁）
-		percent = 20
+		// 20+次失败：检查5%（即将封禁，极小检查）
+		percent = 5
 	}
 
 	threshold := totalUsers * percent / 100
 
-	// 大规模场景优化：针对10K-300K用户规模调整最小阈值
-	// 正常用户命中两级缓存，攻击者才需要全量扫描+早期中断
-	minThreshold := 200 // 大规模场景：最少检查200用户
+	// 严格防御优化：调整最小阈值
+	// 中转节点已豁免，正常用户命中缓存，这里只针对攻击者
+	minThreshold := 100 // 大规模场景：最少检查100用户（降低至100）
 	if totalUsers < 1000 {
-		minThreshold = totalUsers / 10 // 中小规模：至少10%
+		minThreshold = totalUsers / 20 // 中小规模：至少5%（从10%降低）
 	} else if totalUsers < 10000 {
-		minThreshold = totalUsers / 20 // 中等规模：至少5%
+		minThreshold = totalUsers / 50 // 中等规模：至少2%（从5%降低）
 	} else {
-		minThreshold = totalUsers / 50 // 大规模：至少2%，但不少于200
-		if minThreshold < 200 {
-			minThreshold = 200
+		minThreshold = totalUsers / 100 // 大规模：至少1%，但不少于100（从2%降低）
+		if minThreshold < 100 {
+			minThreshold = 100
 		}
 	}
 
