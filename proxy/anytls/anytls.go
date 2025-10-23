@@ -6,8 +6,6 @@ import (
 	"github.com/xtls/xray-core/common"
 )
 
-//go:generate go run github.com/xtls/xray-core/common/errors/errorgen
-
 const protocolName = "anytls"
 
 func init() {

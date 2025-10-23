@@ -45,3 +45,36 @@ func (c *AnyTLSServerConfig) Build() (proto.Message, error) {
 	}
 	return cfg, nil
 }
+
+type AnyTLSClientConfig struct {
+	Address  *Address `json:"address"`
+	Port     uint16   `json:"port"`
+	Email    string   `json:"email"`
+	Password string   `json:"password"`
+	Level    uint32   `json:"level"`
+}
+
+func (c *AnyTLSClientConfig) Build() (proto.Message, error) {
+	if c.Address == nil {
+		return nil, errors.New("ANYTLS: server address is required")
+	}
+	if c.Password == "" {
+		return nil, errors.New("ANYTLS: password is required")
+	}
+
+	cfg := &anytls.ClientConfig{
+		Server: &protocol.ServerEndpoint{
+			Address: c.Address.Build(),
+			Port:    uint32(c.Port),
+			User: &protocol.User{
+				Level: c.Level,
+				Email: c.Email,
+				Account: serial.ToTypedMessage(&anytls.Account{
+					Password: c.Password,
+				}),
+			},
+		},
+	}
+
+	return cfg, nil
+}

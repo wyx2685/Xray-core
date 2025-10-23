@@ -23,19 +23,7 @@ import (
 	"github.com/xtls/xray-core/transport/internet/stat"
 )
 
-const (
-	cmdWaste               byte = 0
-	cmdSYN                 byte = 1
-	cmdPSH                 byte = 2
-	cmdFIN                 byte = 3
-	cmdSettings            byte = 4
-	cmdAlert               byte = 5
-	cmdUpdatePaddingScheme byte = 6
-	cmdSYNACK              byte = 7
-	cmdHeartRequest        byte = 8
-	cmdHeartResponse       byte = 9
-	cmdServerSettings      byte = 10
-)
+// 常量定义在 frame.go 中
 
 type Server struct {
 	policyManager policy.Manager
@@ -84,7 +72,9 @@ func NewServer(ctx context.Context, config *ServerConfig) (*Server, error) {
 	return s, nil
 }
 
-func (s *Server) Network() []xnet.Network { return []xnet.Network{xnet.Network_TCP} }
+func (s *Server) Network() []xnet.Network {
+	return []xnet.Network{xnet.Network_TCP, xnet.Network_UNIX}
+}
 
 func (s *Server) Process(ctx context.Context, network xnet.Network, conn stat.Connection, dispatcher routing.Dispatcher) error {
 	sessPol := s.policyManager.ForLevel(0)

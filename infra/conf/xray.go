@@ -51,6 +51,7 @@ var (
 		"wireguard":   func() interface{} { return &WireGuardConfig{IsClient: true} },
 		"hysteria2":   func() interface{} { return new(Hysteria2ClientConfig) },
 		"tuic":        func() interface{} { return new(TuicClientConfig) },
+		"anytls":      func() interface{} { return new(AnyTLSClientConfig) },
 	}, "protocol", "settings")
 
 	ctllog = log.New(os.Stderr, "xctl> ", 0)
