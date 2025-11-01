@@ -36,7 +36,9 @@ type Validator struct {
 	behaviorSeed  uint64
 	behaviorFused bool
 
-	isRelayNode bool // 标记节点是否处于中转环境（检测到后保持，关闭攻击防御）
+	isRelayNode     bool // 标记节点是否处于中转环境（检测到后保持）
+	defenseEnabled  bool // 攻击防御是否已启用（确认非中转后才启用）
+	detectionActive bool // 是否正在进行环境检测（检测完成后固定）
 }
 
 var ErrNotFound = errors.New("Not Found")
@@ -53,6 +55,13 @@ func (v *Validator) initializeIfNeeded() {
 	}
 	if v.attackDefense == nil {
 		v.attackDefense = NewAttackDefense(nil) // 使用默认配置
+	}
+
+	// 初始状态：检测未完成，攻击防御未启用
+	if !v.detectionActive {
+		v.detectionActive = true
+		v.defenseEnabled = false
+		v.isRelayNode = false
 	}
 }
 
@@ -279,9 +288,12 @@ func (v *Validator) GetStats() ValidatorStats {
 	defer v.RUnlock()
 
 	stats := ValidatorStats{
-		TotalUsers:   len(v.users),
-		IndexedUsers: 0,
-		CacheSize:    0,
+		TotalUsers:      len(v.users),
+		IndexedUsers:    0,
+		CacheSize:       0,
+		IsRelayNode:     v.isRelayNode,
+		DefenseEnabled:  v.defenseEnabled,
+		DetectionActive: v.detectionActive,
 	}
 
 	if v.emailIndex != nil {
@@ -300,11 +312,14 @@ func (v *Validator) GetStats() ValidatorStats {
 
 // ValidatorStats 验证器统计信息
 type ValidatorStats struct {
-	TotalUsers    int // 总用户数
-	IndexedUsers  int // 已建立Email索引的用户数
-	CacheSize     int // 缓存的用户数
-	BannedIPs     int // 被封禁的IP/指纹数
-	TotalFailures int // 总失败次数
+	TotalUsers      int  // 总用户数
+	IndexedUsers    int  // 已建立Email索引的用户数
+	CacheSize       int  // 缓存的用户数
+	BannedIPs       int  // 被封禁的IP/指纹数
+	TotalFailures   int  // 总失败次数
+	IsRelayNode     bool // 是否为中转节点
+	DefenseEnabled  bool // 攻击防御是否已启用
+	DetectionActive bool // 是否正在进行环境检测
 }
 
 // Get a Shadowsocks user.
@@ -339,16 +354,34 @@ func (v *Validator) GetWithCache(bs []byte, command protocol.RequestCommand, cac
 		var isRelay bool
 		if v.userCache != nil {
 			cachedUser, successUsers, isRelay = v.userCache.GetWithFallback(cacheKey)
-			// 检测到中转环境，设置全局开关（只设置一次）
-			if isRelay && !v.isRelayNode {
-				v.Lock()
-				v.isRelayNode = true
-				v.Unlock()
+
+			// 环境检测逻辑（只在检测期间有效）
+			if v.detectionActive {
+				if isRelay {
+					// 检测到中转环境特征（同IP超过阈值用户），立即确认
+					v.Lock()
+					if !v.isRelayNode {
+						v.isRelayNode = true
+						v.defenseEnabled = false
+						v.detectionActive = false // 检测完成
+					}
+					v.Unlock()
+				} else if len(successUsers) >= relayDetectionThreshold {
+					// 观察期结束：已有足够成功用户，且未检测到中转特征
+					// 确认为正常环境，启用攻击防御
+					v.Lock()
+					if !v.isRelayNode && !v.defenseEnabled {
+						v.defenseEnabled = true
+						v.detectionActive = false // 检测完成
+					}
+					v.Unlock()
+				}
+				// 否则：观察期继续，等待更多用户连接
 			}
 		}
 
-		// 只有在非中转节点时才进行攻击防御
-		if !v.isRelayNode && v.attackDefense != nil {
+		// 只有在已确认非中转节点且防御已启用时，才进行攻击防御
+		if v.defenseEnabled && v.attackDefense != nil {
 			isTCP := (command == protocol.RequestCommandTCP)
 			defenseKey = v.attackDefense.CheckAndRecordConnection(cacheKey, isTCP)
 
@@ -392,8 +425,8 @@ func (v *Validator) GetWithCache(bs []byte, command protocol.RequestCommand, cac
 						// 第一级缓存命中且验证成功，记录成功并返回
 						u = cachedUser
 						err = account.CheckIV(iv)
-						// 非中转节点才记录成功
-						if !v.isRelayNode && defenseKey != "" && v.attackDefense != nil {
+						// 防御已启用时才记录成功
+						if v.defenseEnabled && defenseKey != "" && v.attackDefense != nil {
 							v.attackDefense.RecordSuccess(defenseKey)
 						}
 						return
@@ -444,8 +477,8 @@ func (v *Validator) GetWithCache(bs []byte, command protocol.RequestCommand, cac
 								v.userCache.PutWithSuccess(cacheKey, successUser)
 							}
 
-							// 非中转节点才记录成功
-							if !v.isRelayNode && defenseKey != "" && v.attackDefense != nil {
+							// 防御已启用时才记录成功
+							if v.defenseEnabled && defenseKey != "" && v.attackDefense != nil {
 								v.attackDefense.RecordSuccess(defenseKey)
 							}
 							return
@@ -464,21 +497,18 @@ func (v *Validator) GetWithCache(bs []byte, command protocol.RequestCommand, cac
 	totalUsers := len(v.users)
 	earlyStopThreshold := totalUsers // 默认检查所有用户（保证正常用户能连接）
 
-	// 白名单检查优化（新增）：（添加空指针保护）
-	// - 如果IP在白名单中(曾经成功验证过)，跳过早停限制
-	// - 这样正常用户打开新连接时不会因为"缓存未命中"而受早停影响
-	// - 攻击者的IP不在白名单，仍然会触发早停
+	// 只有在防御已启用时，才进行白名单检查和早期中断优化
 	isWhitelisted := false
-	if defenseKey != "" && v.attackDefense != nil {
-		// 使用 defenseKey(纯IP) 而不是 cacheKey(IP:Port)
-		// defenseKey 已经在上面根据协议类型提取过了(TCP=纯IP, UDP=IP:Port)
+	if v.defenseEnabled && defenseKey != "" && v.attackDefense != nil {
+		// 白名单检查优化：
+		// - 如果IP在白名单中(曾经成功验证过)，跳过早停限制
+		// - 这样正常用户打开新连接时不会因为"缓存未命中"而受早停影响
+		// - 攻击者的IP不在白名单，仍然会触发早停
 		isWhitelisted = v.attackDefense.IsWhitelisted(defenseKey)
-	}
 
-	// 只有当连接已经有失败记录时，才启用早期中断（添加空指针保护）
-	// 白名单IP(成功验证过的正常用户)不受早停限制
-	if !isWhitelisted && defenseKey != "" && v.attackDefense != nil {
-		if v.attackDefense.HasFailureRecord(defenseKey) {
+		// 只有当连接已经有失败记录时，才启用早期中断
+		// 白名单IP(成功验证过的正常用户)不受早停限制
+		if !isWhitelisted && v.attackDefense.HasFailureRecord(defenseKey) {
 			// 此连接之前失败过，可能是过期用户，启用渐进式早期中断
 			// 连续失败越多，检查用户数越少，最终降至10个
 			earlyStopThreshold = v.attackDefense.GetEarlyStopThreshold(totalUsers, defenseKey)
@@ -556,8 +586,8 @@ func (v *Validator) GetWithCache(bs []byte, command protocol.RequestCommand, cac
 					v.userCache.PutWithSuccess(cacheKey, user)
 				}
 
-				// 非中转节点才记录验证成功（添加空指针保护）
-				if !v.isRelayNode && defenseKey != "" && v.attackDefense != nil {
+				// 防御已启用时才记录验证成功
+				if v.defenseEnabled && defenseKey != "" && v.attackDefense != nil {
 					v.attackDefense.RecordSuccess(defenseKey)
 				}
 
@@ -573,16 +603,16 @@ func (v *Validator) GetWithCache(bs []byte, command protocol.RequestCommand, cac
 				v.userCache.PutWithSuccess(cacheKey, user)
 			}
 
-			// 非中转节点才记录验证成功
-			if !v.isRelayNode && defenseKey != "" && v.attackDefense != nil {
+			// 防御已启用时才记录验证成功
+			if v.defenseEnabled && defenseKey != "" && v.attackDefense != nil {
 				v.attackDefense.RecordSuccess(defenseKey)
 			}
 			return
 		}
 	}
 
-	// 非中转节点才记录失败
-	if !v.isRelayNode && defenseKey != "" && v.attackDefense != nil {
+	// 防御已启用时才记录失败
+	if v.defenseEnabled && defenseKey != "" && v.attackDefense != nil {
 		v.attackDefense.RecordFailure(defenseKey)
 	}
 
