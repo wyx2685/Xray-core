@@ -158,8 +158,13 @@ func (s *Server) Process(ctx context.Context, network net.Network, conn stat.Con
 		return errors.New("unable to set read deadline").Base(err).AtWarning()
 	}
 
-	first := buf.FromBytes(make([]byte, buf.Size))
-	first.Clear()
+	// 优化：使用 buf.New() 从池中获取 buffer，而不是直接分配
+	// 原代码: first := buf.FromBytes(make([]byte, buf.Size))
+	// 问题：每个连接分配 8KB，大量连接时内存消耗巨大
+	// 优化：使用内存池，连接结束后 buffer 会被回收复用
+	first := buf.New()
+	defer first.Release()
+
 	firstLen, err := first.ReadFrom(conn)
 	if err != nil {
 		return errors.New("failed to read first request").Base(err)
