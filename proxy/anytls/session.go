@@ -105,6 +105,9 @@ func (s *Server) handlePSH(ctx context.Context, sid uint32, body []byte, streams
 	}
 
 	// Normal TCP stream, forward data
+	if st.link == nil {
+		return errors.New("anytls: TCP stream link is nil")
+	}
 	if err := st.link.Writer.WriteMultiBuffer(buf.MultiBuffer{buf.FromBytes(body)}); err != nil {
 		return err
 	}
@@ -115,7 +118,7 @@ func (s *Server) handleFIN(ctx context.Context, sid uint32, streams *map[uint32]
 	smu.Lock()
 	st := (*streams)[sid]
 	smu.Unlock()
-	if st != nil {
+	if st != nil && st.link != nil {
 		common.Close(st.link.Writer)
 		_ = bw.Flush()
 	}
@@ -285,6 +288,14 @@ func (s *Server) handleUDPStream(ctx context.Context, sid uint32, body []byte, s
 
 	// Subsequent PSH: relay continuation UDP data to link
 	// These frames contain the rest of the UDP packet data
+	if st.link == nil {
+		errors.LogWarning(ctx, "anytls: UDP stream link is nil, streamId=", sid)
+		_ = sendFrame(cmdFIN, sid, nil)
+		smu.Lock()
+		delete(*streams, sid)
+		smu.Unlock()
+		return nil
+	}
 	if err := st.link.Writer.WriteMultiBuffer(buf.MultiBuffer{buf.FromBytes(body)}); err != nil {
 		errors.LogWarning(ctx, "anytls: UDP uplink write error, streamId=", sid, " err=", err)
 		_ = sendFrame(cmdFIN, sid, nil)
