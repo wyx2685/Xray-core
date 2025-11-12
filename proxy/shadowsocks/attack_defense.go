@@ -35,10 +35,13 @@ type DefenseConfig struct {
 
 // defenseShardDB 防御分片数据库
 type defenseShardDB struct {
-	mu        sync.RWMutex
-	records   map[string]*failureRecord // key: "ip:port" - 失败记录
-	whitelist map[string]time.Time      // key: "ip" - 白名单(成功验证的IP及过期时间)
+	mu      sync.RWMutex
+	records map[string]*failureRecord // key: "ip:port" - 失败记录
 }
+
+// AttackDefense 的全局白名单（独立出来，使用 sync.Map 避免锁竞争）
+// key: "ip", value: int64 (过期时间的Unix纳秒)
+var globalWhitelist sync.Map
 
 // failureRecord 失败记录
 type failureRecord struct {
@@ -82,8 +85,7 @@ func NewAttackDefense(config *DefenseConfig) *AttackDefense {
 	// 初始化32个分片
 	for i := 0; i < 32; i++ {
 		d.shards[i] = &defenseShardDB{
-			records:   make(map[string]*failureRecord),
-			whitelist: make(map[string]time.Time),
+			records: make(map[string]*failureRecord),
 		}
 	}
 
@@ -133,6 +135,7 @@ func (d *AttackDefense) CheckAllowed(addr string) bool {
 }
 
 // IsWhitelisted 检查IP是否在白名单中（成功验证过的IP）
+// 优化：使用全局 sync.Map，完全无锁
 // 参数 addr: 防御键(TCP=纯IP, UDP=IP:Port)
 func (d *AttackDefense) IsWhitelisted(addr string) bool {
 	if addr == "" {
@@ -150,23 +153,19 @@ func (d *AttackDefense) IsWhitelisted(addr string) bool {
 		}
 	}
 
-	shard := d.getShard(ip) // 使用纯IP计算分片(与RecordSuccess一致)
-	shard.mu.RLock()
-	expireTime, exists := shard.whitelist[ip]
-	shard.mu.RUnlock()
-
+	// 无锁查询全局白名单
+	value, exists := globalWhitelist.Load(ip)
 	if !exists {
 		return false
 	}
 
+	expireTimeNano := value.(int64)
+	now := time.Now().UnixNano()
+
 	// 检查是否过期
-	if time.Now().After(expireTime) {
-		// 过期了,异步清理(避免持锁)
-		go func() {
-			shard.mu.Lock()
-			delete(shard.whitelist, ip)
-			shard.mu.Unlock()
-		}()
+	if now > expireTimeNano {
+		// 过期了，异步删除（避免阻塞）
+		go globalWhitelist.Delete(ip)
 		return false
 	}
 
@@ -268,12 +267,9 @@ func (d *AttackDefense) RecordSuccess(addr string) {
 
 	shard.mu.Unlock()
 
-	// 加入白名单(使用纯IP，1小时过期)
-	// 注意：白名单用IP的分片(与IsWhitelisted一致)
-	ipShard := d.getShard(ip)
-	ipShard.mu.Lock()
-	ipShard.whitelist[ip] = time.Now().Add(1 * time.Hour)
-	ipShard.mu.Unlock()
+	// 加入全局白名单(使用纯IP，1小时过期) - 无锁操作
+	expireTime := time.Now().Add(1 * time.Hour).UnixNano()
+	globalWhitelist.Store(ip, expireTime)
 }
 
 // CheckAndRecordConnection 检查并记录连接
@@ -416,7 +412,22 @@ func (d *AttackDefense) cleanupLoop() {
 
 	for range ticker.C {
 		d.cleanup()
+		d.cleanupWhitelist()
 	}
+}
+
+// cleanupWhitelist 清理过期的白名单（全局sync.Map）
+func (d *AttackDefense) cleanupWhitelist() {
+	now := time.Now().UnixNano()
+
+	// 遍历全局白名单，删除过期项
+	globalWhitelist.Range(func(key, value interface{}) bool {
+		expireTimeNano := value.(int64)
+		if now > expireTimeNano {
+			globalWhitelist.Delete(key)
+		}
+		return true
+	})
 }
 
 // cleanup 清理过期记录（优化：分批清理，减少持锁时间）
@@ -468,22 +479,6 @@ func (d *AttackDefense) cleanup() {
 			// 批量删除失败记录
 			for _, addr := range toDelete {
 				delete(shard.records, addr)
-			}
-
-			// 清理过期的白名单
-			toDeleteWhitelist := make([]string, 0, batchSize)
-			count := 0
-			for ip, expireTime := range shard.whitelist {
-				if now.After(expireTime) {
-					toDeleteWhitelist = append(toDeleteWhitelist, ip)
-					count++
-					if count >= batchSize {
-						break
-					}
-				}
-			}
-			for _, ip := range toDeleteWhitelist {
-				delete(shard.whitelist, ip)
 			}
 
 			recordCount := len(shard.records)

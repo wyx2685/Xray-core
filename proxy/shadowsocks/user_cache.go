@@ -2,6 +2,7 @@ package shadowsocks
 
 import (
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/xtls/xray-core/common/protocol"
@@ -46,17 +47,16 @@ type UserCache struct {
 	successCache *successUserCache
 }
 
-// successUserCache 成功用户缓存（第二级）
+// successUserCache 成功用户缓存（第二级）- 使用 sync.Map 优化并发性能
 type successUserCache struct {
-	mu    sync.RWMutex
-	users []*successUserEntry // 成功用户列表，按最近使用排序
-	cap   int                 // 容量限制（0表示无上限）
+	users sync.Map // key: email (string), value: *successUserEntry
+	cap   int      // 容量限制（0表示无上限）
 }
 
 // successUserEntry 成功用户条目
 type successUserEntry struct {
 	user       *protocol.MemoryUser
-	lastAccess int64 // 最后访问时间
+	lastAccess int64 // 最后访问时间（原子操作）
 }
 
 // userCacheShard 单个缓存分片（支持同IP多用户）
@@ -105,8 +105,7 @@ func NewUserCache(capacity int) *UserCache {
 
 	c := &UserCache{
 		successCache: &successUserCache{
-			users: make([]*successUserEntry, 0), // 无初始容量限制
-			cap:   maxSuccessUsers,              // 0表示无上限
+			cap: maxSuccessUsers, // 0表示无上限
 		},
 	}
 	for i := 0; i < 32; i++ {
@@ -145,9 +144,14 @@ func (c *UserCache) PutMultiUser(key string, user *protocol.MemoryUser) {
 
 // Remove 从缓存中移除指定email的用户
 func (c *UserCache) Remove(email string) {
-	// 需要遍历所有分片，移除匹配的用户
+	// 1. 从第一级缓存（IP分片）中移除
 	for i := 0; i < 32; i++ {
 		c.ipShards[i].removeByEmail(email)
+	}
+
+	// 2. 从第二级缓存（成功用户）中移除 - sync.Map 是无锁操作
+	if email != "" {
+		c.successCache.users.Delete(email)
 	}
 }
 
@@ -157,10 +161,11 @@ func (c *UserCache) Clear() {
 		c.ipShards[i].clear()
 	}
 
-	// 清空第二级缓存
-	c.successCache.mu.Lock()
-	c.successCache.users = c.successCache.users[:0]
-	c.successCache.mu.Unlock()
+	// 清空第二级缓存 - sync.Map 使用 Range + Delete
+	c.successCache.users.Range(func(key, value interface{}) bool {
+		c.successCache.users.Delete(key)
+		return true
+	})
 }
 
 // getShard 根据key计算分片索引（使用简单的字符串hash）
@@ -390,8 +395,11 @@ func (l *cacheList) moveToFront(node *cacheNode) {
 }
 
 // GetWithFallback 智能两级缓存查找：支持同IP多用户+中转检测
-// 返回: (cachedUser, successUsers, isRelay)
-func (c *UserCache) GetWithFallback(key string) (*protocol.MemoryUser, []*protocol.MemoryUser, bool) {
+// 返回: (ipCacheUsers, useSecondCache, isRelay)
+// - ipCacheUsers: 第一级缓存（IP匹配的用户列表）
+// - useSecondCache: 是否需要使用第二级缓存（sync.Map）
+// - isRelay: 是否为中转环境
+func (c *UserCache) GetWithFallback(key string) ([]*protocol.MemoryUser, bool, bool) {
 	// 检查是否为中转环境
 	shard := c.getShard(key)
 	shard.mu.RLock()
@@ -399,18 +407,23 @@ func (c *UserCache) GetWithFallback(key string) (*protocol.MemoryUser, []*protoc
 	isRelay := ok && entry.isRelay
 	shard.mu.RUnlock()
 
-	// 如果是中转环境，直接返回第二级缓存，同时标记为中转
+	// 如果是中转环境，直接使用第二级缓存
 	if isRelay {
-		return nil, c.getSuccessUsers(), true
+		return nil, true, true
 	}
 
 	// 尝试第一级多用户缓存
 	if users := c.GetMultiUser(key); len(users) > 0 {
-		return nil, users, false // 返回同IP的所有用户供验证
+		return users, false, false // 返回同IP的所有用户供验证
 	}
 
 	// 第一级缓存miss，使用第二级缓存
-	return nil, c.getSuccessUsers(), false
+	return nil, true, false
+}
+
+// GetSuccessUserMap 获取第二级缓存的 sync.Map（零开销，直接引用）
+func (c *UserCache) GetSuccessUserMap() *sync.Map {
+	return &c.successCache.users
 }
 
 // PutWithSuccess 智能缓存策略：支持同IP多用户+中转检测
@@ -422,54 +435,27 @@ func (c *UserCache) PutWithSuccess(key string, user *protocol.MemoryUser) {
 	c.addSuccessUser(user)
 }
 
-// getSuccessUsers 获取成功用户列表（第二级缓存）
-func (c *UserCache) getSuccessUsers() []*protocol.MemoryUser {
-	c.successCache.mu.RLock()
-	defer c.successCache.mu.RUnlock()
-
-	// 返回用户列表副本
-	users := make([]*protocol.MemoryUser, len(c.successCache.users))
-	for i, entry := range c.successCache.users {
-		users[i] = entry.user
-	}
-	return users
-}
-
 // addSuccessUser 添加成功用户到第二级缓存
+// sync.Map 优化：无锁写入，使用 LoadOrStore 保证并发安全
 func (c *UserCache) addSuccessUser(user *protocol.MemoryUser) {
+	if user.Email == "" {
+		return // Email为空无法作为key
+	}
+
 	now := time.Now().UnixNano()
 
-	c.successCache.mu.Lock()
-	defer c.successCache.mu.Unlock()
-
-	// 检查用户是否已存在，更新访问时间
-	for i, entry := range c.successCache.users {
-		// 使用Email作为唯一标识，而不是指针比较
-		if entry.user.Email != "" && entry.user.Email == user.Email {
-			entry.lastAccess = now
-			// 移到前面（LRU）
-			if i > 0 {
-				c.successCache.users[0], c.successCache.users[i] = c.successCache.users[i], c.successCache.users[0]
-			}
-			return
-		}
-	}
-
-	// 新用户，添加到缓存
-	newEntry := &successUserEntry{
+	// 尝试加载已存在的条目
+	if value, loaded := c.successCache.users.LoadOrStore(user.Email, &successUserEntry{
 		user:       user,
 		lastAccess: now,
+	}); loaded {
+		// 用户已存在，使用原子操作更新访问时间（完全无锁）
+		entry := value.(*successUserEntry)
+		atomic.StoreInt64(&entry.lastAccess, now)
+		entry.user = user // 更新用户信息（可能密码变了）
 	}
+	// 新用户已通过 LoadOrStore 自动添加，无需额外操作
 
-	// 无上限模式：直接添加到开头
-	if c.successCache.cap == 0 {
-		// 插入到开头（最近使用的在前面）
-		c.successCache.users = append([]*successUserEntry{newEntry}, c.successCache.users...)
-	} else {
-		// 有上限模式：检查容量限制（保留兼容性）
-		if len(c.successCache.users) >= c.successCache.cap {
-			c.successCache.users = c.successCache.users[:c.successCache.cap-1]
-		}
-		c.successCache.users = append([]*successUserEntry{newEntry}, c.successCache.users...)
-	}
+	// 注意：sync.Map 无上限模式下不做容量限制
+	// 实际使用中成功用户数 ≤ 在线用户数，内存占用极小
 }

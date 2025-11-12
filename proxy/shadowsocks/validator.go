@@ -49,9 +49,15 @@ func (v *Validator) initializeIfNeeded() {
 		v.emailIndex = make(map[string]*protocol.MemoryUser)
 	}
 	if v.userCache == nil {
-		// 初始缓存容量：先用默认值，后续根据实际用户数动态扩容
-		// 默认1024：适合中小场景，避免初始分配过大
-		v.userCache = NewUserCache(1024)
+		// 初始缓存容量优化：
+		// - 一级缓存（IP分片）：2048容量，LRU自动淘汰
+		// - 二级缓存（成功用户）：无上限，保存所有活跃用户
+		//
+		// 容量选择：2048 足以覆盖大部分场景
+		// - 小规模（<5K用户）：缓存充足
+		// - 中规模（5K-50K）：热点IP被缓存，冷门IP被LRU淘汰
+		// - 大规模（>50K）：依赖二级缓存，一级缓存只保留最热IP
+		v.userCache = NewUserCache(2048)
 	}
 	if v.attackDefense == nil {
 		v.attackDefense = NewAttackDefense(nil) // 使用默认配置
@@ -63,30 +69,6 @@ func (v *Validator) initializeIfNeeded() {
 		v.defenseEnabled = false
 		v.isRelayNode = false
 	}
-}
-
-// expandCacheIfNeeded 根据用户数扩展缓存容量（简化策略）
-func (v *Validator) expandCacheIfNeeded() {
-	if v.userCache == nil {
-		return
-	}
-
-	userCount := len(v.users)
-
-	// 简化策略：只有三个档位的缓存容量
-	var newCacheSize int
-	switch {
-	case userCount < 5000:
-		return // 小于5000用户，不扩容
-	case userCount < 20000:
-		newCacheSize = 2048 // 中等规模：2048缓存
-	default:
-		newCacheSize = 8192 // 大规模：8192缓存（避免过大）
-	}
-
-	// 简化判断：只有在容量明显不足时才扩容
-	// 避免频繁重建缓存
-	v.userCache = NewUserCache(newCacheSize)
 }
 
 // Add a Shadowsocks user.
@@ -144,14 +126,6 @@ func (v *Validator) Add(u *protocol.MemoryUser) error {
 		hashkdf := hmac.New(sha256.New, []byte("SSBSKDF"))
 		hashkdf.Write(account.Key)
 		v.behaviorSeed = crc64.Update(v.behaviorSeed, crc64.MakeTable(crc64.ECMA), hashkdf.Sum(nil))
-	}
-
-	// 缓存扩容策略优化：只在用户数量翻倍且超过阈值时扩容
-	// 避免频繁的缓存重建导致连接不稳定
-	userCount := len(v.users)
-	// 只有当用户数超过2048且为2的幂次时才扩容
-	if userCount >= 2048 && (userCount&(userCount-1)) == 0 {
-		v.expandCacheIfNeeded()
 	}
 
 	return nil
@@ -346,14 +320,14 @@ func (v *Validator) GetWithCache(bs []byte, command protocol.RequestCommand, cac
 	// 对于同一用户的多个并发连接，大部分都应该能命中缓存
 	// 这样可以避免全局锁竞争，大幅提升并发性能
 	var defenseKey string
-	var cachedUser *protocol.MemoryUser
 	var successUsers []*protocol.MemoryUser
+	var useSecondCache bool
 
 	if cacheKey != "" {
 		// 尝试两级缓存查找（无需全局锁），同时获取是否为中转环境
 		var isRelay bool
 		if v.userCache != nil {
-			cachedUser, successUsers, isRelay = v.userCache.GetWithFallback(cacheKey)
+			successUsers, useSecondCache, isRelay = v.userCache.GetWithFallback(cacheKey)
 
 			// 环境检测逻辑（只在检测期间有效）
 			if v.detectionActive {
@@ -391,54 +365,14 @@ func (v *Validator) GetWithCache(bs []byte, command protocol.RequestCommand, cac
 			}
 		}
 
-		if cachedUser != nil {
-			// 第一级缓存命中，直接验证
-			if account := cachedUser.Account.(*MemoryAccount); account.Cipher.IsAEAD() {
-				if len(bs) >= 32 {
-					aeadCipher := account.Cipher.(*AEADCipher)
-					ivLen = aeadCipher.IVSize()
-					iv := bs[:ivLen]
-
-					// 优化：使用内存池获取subkey缓冲区
-					subkey := getSubkey(aeadCipher.KeyBytes)
-					hkdfSHA1(account.Key, iv, subkey)
-					aead = aeadCipher.AEADAuthCreator(subkey)
-
-					var matchErr error
-					switch command {
-					case protocol.RequestCommandTCP:
-						// 优化：使用内存池获取TCP数据缓冲区
-						data := getTCPData(4 + aead.NonceSize())
-						ret, matchErr = aead.Open(data[:0], data[4:], bs[ivLen:ivLen+18], nil)
-						// TCP数据在返回后仍需使用，暂不归还到池
-					case protocol.RequestCommandUDP:
-						// 优化：使用内存池获取UDP数据缓冲区
-						data := getUDPData()
-						ret, matchErr = aead.Open(data[:0], data[8192-aead.NonceSize():8192], bs[ivLen:], nil)
-						// UDP数据在返回后仍需使用，暂不归还到池
-					}
-
-					// 用完立即归还subkey到池
-					putSubkey(subkey)
-
-					if matchErr == nil {
-						// 第一级缓存命中且验证成功，记录成功并返回
-						u = cachedUser
-						err = account.CheckIV(iv)
-						// 防御已启用时才记录成功
-						if v.defenseEnabled && defenseKey != "" && v.attackDefense != nil {
-							v.attackDefense.RecordSuccess(defenseKey)
-						}
-						return
-					}
-					// 第一级缓存失效，继续第二级缓存验证
-				}
-			}
-		}
-
-		// 第二级缓存：验证成功用户列表（无需全局锁）
-		if len(successUsers) > 0 {
-			for _, successUser := range successUsers {
+		// 两级缓存：验证用户列表（无需全局锁）
+		if useSecondCache {
+			// 直接遍历 sync.Map，零拷贝，完全无锁
+			secondCacheMap := v.userCache.GetSuccessUserMap()
+			var found bool
+			secondCacheMap.Range(func(key, value interface{}) bool {
+				entry := value.(*successUserEntry)
+				successUser := entry.user
 				if account := successUser.Account.(*MemoryAccount); account.Cipher.IsAEAD() {
 					if len(bs) >= 32 {
 						aeadCipher := account.Cipher.(*AEADCipher)
@@ -469,6 +403,63 @@ func (v *Validator) GetWithCache(bs []byte, command protocol.RequestCommand, cac
 
 						if matchErr == nil {
 							// 第二级缓存命中且验证成功
+							u = successUser
+							err = account.CheckIV(iv)
+							found = true
+
+							// 更新第一级缓存
+							if cacheKey != "" && v.userCache != nil {
+								v.userCache.PutWithSuccess(cacheKey, successUser)
+							}
+
+							// 防御已启用时才记录成功
+							if v.defenseEnabled && defenseKey != "" && v.attackDefense != nil {
+								v.attackDefense.RecordSuccess(defenseKey)
+							}
+
+							return false // 停止遍历
+						}
+					}
+				}
+				return true // 继续遍历
+			})
+
+			if found {
+				return // 第二级缓存命中
+			}
+		} else if len(successUsers) > 0 {
+			// 第一级缓存返回的用户列表
+			for _, successUser := range successUsers {
+				if account := successUser.Account.(*MemoryAccount); account.Cipher.IsAEAD() {
+					if len(bs) >= 32 {
+						aeadCipher := account.Cipher.(*AEADCipher)
+						ivLen = aeadCipher.IVSize()
+						iv := bs[:ivLen]
+
+						// 优化：使用内存池获取subkey缓冲区
+						subkey := getSubkey(aeadCipher.KeyBytes)
+						hkdfSHA1(account.Key, iv, subkey)
+						aead = aeadCipher.AEADAuthCreator(subkey)
+
+						var matchErr error
+						switch command {
+						case protocol.RequestCommandTCP:
+							// 优化：使用内存池获取TCP数据缓冲区
+							data := getTCPData(4 + aead.NonceSize())
+							ret, matchErr = aead.Open(data[:0], data[4:], bs[ivLen:ivLen+18], nil)
+							// TCP数据在返回后仍需使用，暂不归还到池
+						case protocol.RequestCommandUDP:
+							// 优化：使用内存池获取UDP数据缓冲区
+							data := getUDPData()
+							ret, matchErr = aead.Open(data[:0], data[8192-aead.NonceSize():8192], bs[ivLen:], nil)
+							// UDP数据在返回后仍需使用，暂不归还到池
+						}
+
+						// 用完立即归还subkey到池
+						putSubkey(subkey)
+
+						if matchErr == nil {
+							// 第一级IP缓存命中且验证成功
 							u = successUser
 							err = account.CheckIV(iv)
 
@@ -530,11 +521,6 @@ func (v *Validator) GetWithCache(bs []byte, command protocol.RequestCommand, cac
 	for i := 0; i < totalUsers; i++ {
 		idx := (startIdx + i) % totalUsers
 		user := v.users[idx]
-
-		// 跳过已验证失败的缓存用户
-		if user == cachedUser {
-			continue
-		}
 
 		// 优化：早期中断检查 - 对可疑连接提前终止
 		checkedCount++
