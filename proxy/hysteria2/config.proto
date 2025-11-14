@@ -49,7 +49,21 @@ message Masquerade {
 }
 
 message ClientConfig {
-  repeated xray.common.protocol.ServerEndpoint server = 1;
+  xray.common.protocol.ServerEndpoint server = 1;  // 单个服务器地址，不使用列表
+  
+  // Bandwidth control (mbps)
+  uint64 up_mbps = 2;
+  uint64 down_mbps = 3;
+  
+  // QUIC traffic obfuscation
+  Obfs obfs = 4;
+  
+  // Port hopping interval (e.g., "30s")
+  string hop_interval = 5;
+  
+  // Server port range list for port hopping (e.g., ["2080:3000", "4000-5000"])
+  // Conflicts with server.port, when set, server.port is ignored
+  repeated string server_ports = 6;
 }
 
 message ServerConfig {

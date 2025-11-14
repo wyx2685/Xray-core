@@ -120,74 +120,77 @@ func (c *Hysteria2ServerConfig) Build() (proto.Message, error) {
 	return config, nil
 }
 
-// Hysteria2ServerTarget is configuration of a single Hysteria2 server
-type Hysteria2ServerTarget struct {
-	Address  *Address `json:"address"`
-	Port     uint16   `json:"port"`
-	Level    byte     `json:"level"`
-	Email    string   `json:"email"`
-	Password string   `json:"password"`
-}
-
 // Hysteria2ClientConfig is Outbound configuration for Hysteria2
 type Hysteria2ClientConfig struct {
-	Address  *Address                 `json:"address"`
-	Port     uint16                   `json:"port"`
-	Level    byte                     `json:"level"`
-	Email    string                   `json:"email"`
-	Password string                   `json:"password"`
-	Servers  []*Hysteria2ServerTarget `json:"servers"`
+	Address     *Address             `json:"address"`
+	Port        uint16               `json:"port"`
+	Ports       []string             `json:"ports"`
+	Password    string               `json:"password"`
+	Email       string               `json:"email"`
+	Level       byte                 `json:"level"`
+	UpMbps      uint64               `json:"up_mbps"`
+	DownMbps    uint64               `json:"down_mbps"`
+	HopInterval string               `json:"hop_interval"`
+	Obfs        *Hysteria2ObfsConfig `json:"obfs"`
 }
 
 // Build implements Buildable
 func (c *Hysteria2ClientConfig) Build() (proto.Message, error) {
-	// Support single server or servers array
-	if c.Address != nil {
-		c.Servers = []*Hysteria2ServerTarget{
-			{
-				Address:  c.Address,
-				Port:     c.Port,
-				Level:    c.Level,
-				Email:    c.Email,
+	if c.Address == nil {
+		return nil, errors.New("Hysteria2: server address is not set")
+	}
+
+	// If ports is set, use it; otherwise fall back to port
+	if len(c.Ports) == 0 && c.Port == 0 {
+		return nil, errors.New("Hysteria2: either ports or port must be specified")
+	}
+
+	if c.Password == "" {
+		return nil, errors.New("Hysteria2: password is not specified")
+	}
+
+	// Set default hop_interval if ports is used and hop_interval is empty
+	hopInterval := c.HopInterval
+	if len(c.Ports) > 0 && hopInterval == "" {
+		hopInterval = "30s"
+	}
+
+	// When using ports for port hopping, port field is still required for UDP socket creation
+	// If not specified, use default port 443 (standard HTTPS/QUIC port)
+	port := c.Port
+	if len(c.Ports) > 0 && port == 0 {
+		port = 443
+	}
+
+	config := &hysteria2.ClientConfig{
+		UpMbps:      c.UpMbps,
+		DownMbps:    c.DownMbps,
+		HopInterval: hopInterval,
+		ServerPorts: c.Ports,
+	}
+
+	// Build obfuscation config
+	if c.Obfs != nil {
+		if c.Obfs.Type != "" && c.Obfs.Type != "salamander" {
+			return nil, errors.New("Hysteria2: only 'salamander' obfuscation type is supported")
+		}
+
+		config.Obfs = &hysteria2.Obfs{
+			Type:     c.Obfs.Type,
+			Password: c.Obfs.Password,
+		}
+	}
+
+	config.Server = &protocol.ServerEndpoint{
+		Address: c.Address.Build(),
+		Port:    uint32(port),
+		User: &protocol.User{
+			Level: uint32(c.Level),
+			Email: c.Email,
+			Account: serial.ToTypedMessage(&hysteria2.Account{
 				Password: c.Password,
-			},
-		}
-	}
-
-	if len(c.Servers) == 0 {
-		return nil, errors.New("Hysteria2: no server configured")
-	}
-
-	if len(c.Servers) > 1 {
-		return nil, errors.New("Hysteria2: multiple servers not supported, use multiple outbounds instead")
-	}
-
-	config := &hysteria2.ClientConfig{}
-
-	for _, server := range c.Servers {
-		if server.Address == nil {
-			return nil, errors.New("Hysteria2: server address is not set")
-		}
-		if server.Port == 0 {
-			return nil, errors.New("Hysteria2: invalid server port")
-		}
-		if server.Password == "" {
-			return nil, errors.New("Hysteria2: password is not specified")
-		}
-
-		config.Server = append(config.Server, &protocol.ServerEndpoint{
-			Address: server.Address.Build(),
-			Port:    uint32(server.Port),
-			User: &protocol.User{
-				Level: uint32(server.Level),
-				Email: server.Email,
-				Account: serial.ToTypedMessage(&hysteria2.Account{
-					Password: server.Password,
-				}),
-			},
-		})
-
-		break
+			}),
+		},
 	}
 
 	return config, nil
