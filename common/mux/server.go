@@ -5,7 +5,6 @@ import (
 	"io"
 	"time"
 
-	"github.com/xtls/xray-core/app/dispatcher"
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/errors"
@@ -64,13 +63,8 @@ func (s *Server) DispatchLink(ctx context.Context, dest net.Destination, link *t
 	if dest.Address != muxCoolAddress {
 		return s.dispatcher.DispatchLink(ctx, dest, link)
 	}
-	if dispatcher, ok := s.dispatcher.(*dispatcher.DefaultDispatcher); ok {
-		link = dispatcher.WrapLink(ctx, link)
-	} else {
-		link = &transport.Link{
-			Reader: &buf.TimeoutWrapperReader{Reader: link.Reader},
-			Writer: link.Writer,
-		}
+	if d, ok := s.dispatcher.(routing.WrapLinkDispatcher); ok {
+		link = d.WrapLink(ctx, link)
 	}
 	worker, err := NewServerWorker(ctx, s.dispatcher, link)
 	if err != nil {
