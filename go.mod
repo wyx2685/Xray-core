@@ -11,7 +11,7 @@ require (
 	github.com/miekg/dns v1.1.68
 	github.com/pelletier/go-toml v1.9.5
 	github.com/pires/go-proxyproto v0.8.1
-	github.com/quic-go/quic-go v0.56.0
+	github.com/quic-go/quic-go v0.57.1
 	github.com/refraction-networking/utls v1.8.1
 	github.com/sagernet/sing v0.8.0-beta.5
 	github.com/sagernet/sing-quic v0.6.0-beta.3
@@ -45,7 +45,7 @@ require (
 	github.com/klauspost/cpuid/v2 v2.0.12 // indirect
 	github.com/kr/text v0.2.0 // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect
-	github.com/quic-go/qpack v0.5.1 // indirect
+	github.com/quic-go/qpack v0.6.0 // indirect
 	github.com/riobard/go-bloom v0.0.0-20200614022211-cdc8013cb5b3 // indirect
 	github.com/sagernet/quic-go v0.54.0-sing-box-mod.3 // indirect
 	github.com/vishvananda/netns v0.0.5 // indirect
