@@ -3,8 +3,6 @@ package conf
 import (
 	"context"
 	"encoding/json"
-	"log"
-	"os"
 	"path/filepath"
 	"strings"
 
@@ -53,8 +51,6 @@ var (
 		"tuic":        func() interface{} { return new(TuicClientConfig) },
 		"anytls":      func() interface{} { return new(AnyTLSClientConfig) },
 	}, "protocol", "settings")
-
-	ctllog = log.New(os.Stderr, "xctl> ", 0)
 )
 
 type SniffingConfig struct {
