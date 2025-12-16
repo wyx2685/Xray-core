@@ -312,8 +312,8 @@ func (v *UDPReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 		buffer.Release()
 		return nil, err
 	}
-	validator := new(Validator)
-	validator.Add(v.User)
+	// 使用轻量级 Validator，避免 goroutine 泄漏
+	validator := NewSimpleValidator(v.User)
 
 	u, payload, err := DecodeUDPPacket(validator, buffer)
 	if err != nil {

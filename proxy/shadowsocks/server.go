@@ -145,8 +145,8 @@ func (s *Server) handleUDPPayload(ctx context.Context, conn stat.Connection, dis
 			var err error
 
 			if inbound.User != nil {
-				validator := new(Validator)
-				validator.Add(inbound.User)
+				// 使用轻量级 Validator，避免 goroutine 泄漏
+				validator := NewSimpleValidator(inbound.User)
 				request, data, err = DecodeUDPPacket(validator, payload)
 			} else {
 				// 优化：传递源地址作为缓存键

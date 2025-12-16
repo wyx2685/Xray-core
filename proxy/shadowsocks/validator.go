@@ -43,6 +43,20 @@ type Validator struct {
 
 var ErrNotFound = errors.New("Not Found")
 
+// NewSimpleValidator 创建一个轻量级的 Validator，不启动后台 goroutine
+// 用于单用户场景（如 UDP 回复解码），避免 goroutine 泄漏
+func NewSimpleValidator(user *protocol.MemoryUser) *Validator {
+	v := &Validator{
+		users:      []*protocol.MemoryUser{user},
+		emailIndex: make(map[string]*protocol.MemoryUser),
+		// 不初始化 userCache 和 attackDefense，避免启动 cleanupLoop
+	}
+	if user.Email != "" {
+		v.emailIndex[strings.ToLower(user.Email)] = user
+	}
+	return v
+}
+
 // initializeIfNeeded 初始化索引和缓存（内部使用，调用者需持有锁）
 func (v *Validator) initializeIfNeeded() {
 	if v.emailIndex == nil {
