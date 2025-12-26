@@ -145,9 +145,8 @@ func (s *Server) handleUDPPayload(ctx context.Context, conn stat.Connection, dis
 			var err error
 
 			if inbound.User != nil {
-				validator := new(Validator)
-				validator.Add(inbound.User)
-				request, data, err = DecodeUDPPacket(validator, payload)
+				// 已知会话用户，直接基于该用户解码，避免修改全局 validator
+				request, data, err = DecodeUDPPacketWithUser(inbound.User, payload)
 			} else {
 				// 优化：传递源地址作为缓存键
 				cacheKey := ""
