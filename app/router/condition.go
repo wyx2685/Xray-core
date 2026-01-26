@@ -2,7 +2,10 @@ package router
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 
 	"github.com/xtls/xray-core/common/errors"
@@ -54,7 +57,8 @@ type DomainMatcher struct {
 
 func NewMphMatcherGroup(domains []*Domain) (*DomainMatcher, error) {
 	g := strmatcher.NewMphMatcherGroup()
-	for _, d := range domains {
+	for i, d := range domains {
+		domains[i] = nil
 		matcherType, f := matcherTypeMap[d.Type]
 		if !f {
 			errors.LogError(context.Background(), "ignore unsupported domain type ", d.Type, " of rule ", d.Value)
@@ -304,4 +308,97 @@ func (m *AttributeMatcher) Apply(ctx routing.Context) bool {
 		return false
 	}
 	return m.Match(attributes)
+}
+
+type ProcessNameMatcher struct {
+	ProcessNames  []string
+	AbsPaths      []string
+	Folders       []string
+	MatchXraySelf bool
+}
+
+func NewProcessNameMatcher(names []string) *ProcessNameMatcher {
+	processNames := []string{}
+	folders := []string{}
+	absPaths := []string{}
+	matchXraySelf := false
+	for _, name := range names {
+		if name == "self/" {
+			matchXraySelf = true
+			continue
+		}
+		// replace xray/ with self executable path
+		if name == "xray/" {
+			xrayPath, err := os.Executable()
+			if err != nil {
+				errors.LogError(context.Background(), "Failed to get xray executable path: ", err)
+				continue
+			}
+			name = xrayPath
+		}
+		name := filepath.ToSlash(name)
+		// /usr/bin/
+		if strings.HasSuffix(name, "/") {
+			folders = append(folders, name)
+			continue
+		}
+		// /usr/bin/curl
+		if strings.Contains(name, "/") {
+			absPaths = append(absPaths, name)
+			continue
+		}
+		// curl.exe or curl
+		processNames = append(processNames, strings.TrimSuffix(name, ".exe"))
+	}
+	return &ProcessNameMatcher{
+		ProcessNames:  processNames,
+		AbsPaths:      absPaths,
+		Folders:       folders,
+		MatchXraySelf: matchXraySelf,
+	}
+}
+
+func (m *ProcessNameMatcher) Apply(ctx routing.Context) bool {
+	if len(ctx.GetSourceIPs()) == 0 {
+		return false
+	}
+	srcPort := ctx.GetSourcePort().String()
+	srcIP := ctx.GetSourceIPs()[0].String()
+	var network string
+	switch ctx.GetNetwork() {
+	case net.Network_TCP:
+		network = "tcp"
+	case net.Network_UDP:
+		network = "udp"
+	default:
+		return false
+	}
+	src, err := net.ParseDestination(strings.Join([]string{network, srcIP, srcPort}, ":"))
+	if err != nil {
+		return false
+	}
+	pid, name, absPath, err := net.FindProcess(src)
+	if err != nil {
+		if err != net.ErrNotLocal {
+			errors.LogError(context.Background(), "Unables to find local process name: ", err)
+		}
+		return false
+	}
+	if m.MatchXraySelf {
+		if pid == os.Getpid() {
+			return true
+		}
+	}
+	if slices.Contains(m.ProcessNames, name) {
+		return true
+	}
+	if slices.Contains(m.AbsPaths, absPath) {
+		return true
+	}
+	for _, f := range m.Folders {
+		if strings.HasPrefix(absPath, f) {
+			return true
+		}
+	}
+	return false
 }
