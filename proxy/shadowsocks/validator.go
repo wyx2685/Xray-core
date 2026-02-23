@@ -404,7 +404,6 @@ func (v *Validator) GetWithCache(bs []byte, command protocol.RequestCommand, cac
 						if matchErr == nil {
 							// 第二级缓存命中且验证成功
 							u = successUser
-							err = account.CheckIV(iv)
 							found = true
 
 							// 更新第一级缓存
@@ -461,7 +460,6 @@ func (v *Validator) GetWithCache(bs []byte, command protocol.RequestCommand, cac
 						if matchErr == nil {
 							// 第一级IP缓存命中且验证成功
 							u = successUser
-							err = account.CheckIV(iv)
 
 							// 更新第一级缓存
 							if cacheKey != "" && v.userCache != nil {
@@ -564,7 +562,6 @@ func (v *Validator) GetWithCache(bs []byte, command protocol.RequestCommand, cac
 
 			if matchErr == nil {
 				u = user
-				err = account.CheckIV(iv)
 
 				// 优化：找到用户后更新两级缓存（异步更新，不阻塞当前请求）
 				if cacheKey != "" && v.userCache != nil {

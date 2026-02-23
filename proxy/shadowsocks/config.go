@@ -10,7 +10,6 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	"github.com/xtls/xray-core/common"
-	"github.com/xtls/xray-core/common/antireplay"
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/crypto"
 	"github.com/xtls/xray-core/common/errors"
@@ -25,8 +24,6 @@ type MemoryAccount struct {
 	CipherType CipherType
 	Key        []byte
 	Password   string
-
-	replayFilter antireplay.GeneralizedReplayFilter
 }
 
 var ErrIVNotUnique = errors.New("IV is not unique")
@@ -43,18 +40,7 @@ func (a *MemoryAccount) ToProto() proto.Message {
 	return &Account{
 		CipherType: a.CipherType,
 		Password:   a.Password,
-		IvCheck:    a.replayFilter != nil,
 	}
-}
-
-func (a *MemoryAccount) CheckIV(iv []byte) error {
-	if a.replayFilter == nil {
-		return nil
-	}
-	if a.replayFilter.Check(iv) {
-		return nil
-	}
-	return ErrIVNotUnique
 }
 
 func createAesGcm(key []byte) cipher.AEAD {
@@ -118,14 +104,6 @@ func (a *Account) AsAccount() (protocol.Account, error) {
 		CipherType: a.CipherType,
 		Key:        passwordToCipherKey([]byte(a.Password), Cipher.KeySize()),
 		Password:   a.Password,
-		replayFilter: func() antireplay.GeneralizedReplayFilter {
-			if a.IvCheck {
-				// 优化：使用分片BloomRing（64分片）替代单一BloomRing
-				// 在高并发场景下可将锁争用降低到原来的1/64
-				return antireplay.NewDefaultShardedBloomRing()
-			}
-			return nil
-		}(),
 	}, nil
 }
 
