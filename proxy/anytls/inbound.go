@@ -116,10 +116,6 @@ func (s *Server) Process(ctx context.Context, network xnet.Network, conn stat.Co
 	fr := newFrameReader(br, ctx)
 	fw := newFrameWriter(bw)
 
-	readFrame := func() (cmd byte, sid uint32, data []byte, err error) {
-		return fr.read()
-	}
-
 	sendFrame := func(cmd byte, sid uint32, data []byte) error {
 		writeMu.Lock()
 		defer writeMu.Unlock()
@@ -133,7 +129,7 @@ func (s *Server) Process(ctx context.Context, network xnet.Network, conn stat.Co
 	var clientVersion int = 1
 	var clientPaddingMD5 string
 	for {
-		c, _, data, err := readFrame()
+		c, _, data, err := fr.read()
 		if err != nil {
 			return err
 		}
@@ -186,7 +182,7 @@ func (s *Server) Process(ctx context.Context, network xnet.Network, conn stat.Co
 	}
 
 	for {
-		cmd, sid, body, err := readFrame()
+		cmd, sid, body, err := fr.read()
 		if err != nil {
 			return err
 		}

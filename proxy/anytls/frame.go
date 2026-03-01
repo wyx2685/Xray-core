@@ -9,20 +9,17 @@ import (
 )
 
 const ( // cmds
-	cmdWaste               = 0 // Paddings
-	cmdSYN                 = 1 // stream open
-	cmdPSH                 = 2 // data push
-	cmdFIN                 = 3 // stream close, a.k.a EOF mark
-	cmdSettings            = 4 // Settings (Client send to Server)
-	cmdAlert               = 5 // Alert
-	cmdUpdatePaddingScheme = 6 // update padding scheme
-	// Since version 2
-	cmdSYNACK         = 7  // Server reports to the client that the stream has been opened
-	cmdHeartRequest   = 8  // Keep alive command
-	cmdHeartResponse  = 9  // Keep alive command
-	cmdServerSettings = 10 // Settings (Server send to client)
-
-	maxFrameDataLength = 65535 // 最大帧数据长度（uint16 最大值）
+	cmdWaste               = 0  // Paddings
+	cmdSYN                 = 1  // stream open
+	cmdPSH                 = 2  // data push
+	cmdFIN                 = 3  // stream close, a.k.a EOF mark
+	cmdSettings            = 4  // Settings (Client send to Server)
+	cmdAlert               = 5  // Alert
+	cmdUpdatePaddingScheme = 6  // update padding scheme
+	cmdSYNACK              = 7  // Server reports to the client that the stream has been opened
+	cmdHeartRequest        = 8  // Keep alive command
+	cmdHeartResponse       = 9  // Keep alive command
+	cmdServerSettings      = 10 // Settings (Server send to client)
 )
 
 // frameReader 帧读取器，保持 header buffer 复用以减少分配
@@ -35,9 +32,8 @@ type frameReader struct {
 
 func newFrameReader(br *buf.BufferedReader, ctx context.Context) *frameReader {
 	return &frameReader{
-		br:     br,
-		ctx:    ctx,
-		buffer: buf.New(),
+		br:  br,
+		ctx: ctx,
 	}
 }
 
@@ -54,15 +50,7 @@ func (r *frameReader) read() (cmd byte, sid uint32, data []byte, err error) {
 	length := binary.BigEndian.Uint16(r.header[5:7])
 
 	if length > 0 {
-		if length <= buf.Size {
-			// 小于等于 8KB，使用复用的缓冲区
-			r.buffer.Clear()
-			data = r.buffer.Extend(int32(length))
-		} else {
-			// 大于 8KB，直接分配，避免浪费对象池
-			data = make([]byte, length)
-		}
-
+		data = make([]byte, length)
 		_, err = io.ReadFull(r.br, data)
 		if err != nil {
 			return cmd, sid, nil, err
