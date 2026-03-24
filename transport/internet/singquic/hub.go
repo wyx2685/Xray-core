@@ -125,6 +125,5 @@ func listenerCreator(protocolName string) internet.ListenFunc {
 
 func init() {
 	// Register transport listeners for sing-quic based protocols
-	common.Must(internet.RegisterTransportListener(ProtocolNameHysteria2, listenerCreator(ProtocolNameHysteria2)))
 	common.Must(internet.RegisterTransportListener(ProtocolNameTUIC, listenerCreator(ProtocolNameTUIC)))
 }

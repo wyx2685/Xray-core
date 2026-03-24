@@ -1012,8 +1012,6 @@ func (p TransportProtocol) Build() (string, error) {
 	case "httpupgrade":
 		errors.PrintNonRemovalDeprecatedFeatureWarning("HTTPUpgrade transport (with ALPN http/1.1, etc.)", "XHTTP H2 & H3")
 		return "httpupgrade", nil
-	case "hysteria2":
-		return "hysteria2", nil
 	case "tuic":
 		return "tuic", nil
 	case "h2", "h3", "http":
