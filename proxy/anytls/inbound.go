@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/errors"
 	xnet "github.com/xtls/xray-core/common/net"
@@ -81,11 +82,30 @@ func (s *Server) Process(ctx context.Context, network xnet.Network, conn stat.Co
 	_ = conn.SetReadDeadline(time.Now().Add(sessPol.Timeouts.Handshake))
 
 	br := &buf.BufferedReader{Reader: buf.NewReader(conn)}
+	bw := buf.NewBufferedWriter(buf.NewWriter(conn))
+	fw := newFrameWriter(bw)
+
+	var writeMu sync.Mutex
+	streams := make(map[uint32]*stream)
+	var smu sync.Mutex
+
+	sendFrame := func(cmd byte, sid uint32, data []byte) error {
+		writeMu.Lock()
+		defer writeMu.Unlock()
+		if err := fw.write(cmd, sid, data); err != nil {
+			return err
+		}
+		return fw.flush()
+	}
+
+	head := [7]byte{}
+
 	// auth header: 32B sha256(password) + 2B padlen
 	h := make([]byte, 34)
 	if _, err := io.ReadFull(br, h); err != nil {
 		return errors.New("anytls: read auth").Base(err)
 	}
+
 	var sum [32]byte
 	copy(sum[:], h[:32])
 	snap := s.loadStore()
@@ -93,6 +113,7 @@ func (s *Server) Process(ctx context.Context, network xnet.Network, conn stat.Co
 	if user == nil {
 		return errors.New("anytls: invalid user")
 	}
+
 	padlen := binary.BigEndian.Uint16(h[32:34])
 	if padlen > 0 {
 		if _, err := io.ReadFull(br, make([]byte, padlen)); err != nil {
@@ -106,105 +127,135 @@ func (s *Server) Process(ctx context.Context, network xnet.Network, conn stat.Co
 	inb.User = user
 	inb.CanSpliceCopy = 3
 
-	bw := buf.NewBufferedWriter(buf.NewWriter(conn))
-	// serialize all writes to the underlying connection
-	var writeMu sync.Mutex
-	streams := make(map[uint32]*stream)
-	var smu sync.Mutex
-
-	// Frame operations
-	fr := newFrameReader(br, ctx)
-	fw := newFrameWriter(bw)
-
-	sendFrame := func(cmd byte, sid uint32, data []byte) error {
-		writeMu.Lock()
-		defer writeMu.Unlock()
-		if err := fw.write(cmd, sid, data); err != nil {
-			return err
-		}
-		return fw.flush()
-	}
-
-	// settings handshake: expect cmdSettings first
 	var clientVersion int = 1
 	var clientPaddingMD5 string
+	var handshakeDone bool
 	for {
-		c, _, data, err := fr.read()
+		_, err := io.ReadFull(br, head[:])
 		if err != nil {
 			return err
 		}
-		if c == cmdWaste {
-			continue
-		}
-		if c != cmdSettings {
-			return errors.New("anytls: expect settings first")
-		}
-		// parse settings key=value per line
-		if len(data) > 0 {
-			lines := strings.Split(string(data), "\n")
-			for _, line := range lines {
-				if line == "" {
-					continue
-				}
-				kv := strings.SplitN(line, "=", 2)
-				if len(kv) != 2 {
-					continue
-				}
-				k := kv[0]
-				v := kv[1]
-				switch k {
-				case "v":
-					if v == "2" {
-						clientVersion = 2
-					}
-				case "padding-md5":
-					clientPaddingMD5 = strings.ToLower(v)
-				}
-			}
-		}
-		// For v>=2 client, send server settings v=2
-		if clientVersion >= 2 {
-			if err := sendFrame(cmdServerSettings, 0, []byte("v=2")); err != nil {
-				return err
-			}
-		}
-		// If server has paddingScheme and md5 mismatches, request update
-		if s.paddingScheme != "" && clientPaddingMD5 != "" {
-			sum := md5.Sum([]byte(s.paddingScheme))
-			localMD5 := strings.ToLower(hex.EncodeToString(sum[:]))
-			if localMD5 != clientPaddingMD5 {
-				if err := sendFrame(cmdUpdatePaddingScheme, 0, []byte(s.paddingScheme)); err != nil {
-					return err
-				}
-			}
-		}
-		break
-	}
 
-	for {
-		cmd, sid, body, err := fr.read()
-		if err != nil {
-			return err
-		}
+		cmd := head[0]
+		sid := binary.BigEndian.Uint32(head[1:5])
+		length := int(binary.BigEndian.Uint16(head[5:7]))
 
 		switch cmd {
 		case cmdWaste:
+			if length > 0 {
+				discard := make([]byte, length)
+				if _, err := io.ReadFull(br, discard); err != nil {
+					return err
+				}
+			}
 			continue
+		case cmdSettings:
+			var text []byte
+			if length > 0 {
+				text = make([]byte, length)
+				if _, err := io.ReadFull(br, text); err != nil {
+					return err
+				}
+			}
+			if handshakeDone {
+				continue
+			}
+			if len(text) > 0 {
+				lines := strings.Split(string(text), "\n")
+				for _, line := range lines {
+					if line == "" {
+						continue
+					}
+					kv := strings.SplitN(line, "=", 2)
+					if len(kv) != 2 {
+						continue
+					}
+					switch kv[0] {
+					case "v":
+						if kv[1] == "2" {
+							clientVersion = 2
+						}
+					case "padding-md5":
+						clientPaddingMD5 = strings.ToLower(kv[1])
+					}
+				}
+			}
+			if clientVersion >= 2 {
+				if err := sendFrame(cmdServerSettings, 0, []byte("v=2")); err != nil {
+					return err
+				}
+			}
+			if s.paddingScheme != "" && clientPaddingMD5 != "" {
+				sum := md5.Sum([]byte(s.paddingScheme))
+				localMD5 := strings.ToLower(hex.EncodeToString(sum[:]))
+				if localMD5 != clientPaddingMD5 {
+					if err := sendFrame(cmdUpdatePaddingScheme, 0, []byte(s.paddingScheme)); err != nil {
+						return err
+					}
+				}
+			}
+			handshakeDone = true
 		case cmdHeartRequest:
+			if length > 0 {
+				discard := make([]byte, length)
+				if _, err := io.ReadFull(br, discard); err != nil {
+					return err
+				}
+			}
 			if err := sendFrame(cmdHeartResponse, 0, nil); err != nil {
 				return err
 			}
 		case cmdSYN:
-			if err := s.handleSYN(ctx, sid, body, &streams, &smu, dispatcher, sendFrame); err != nil {
-				return err
+			if length > 0 {
+				discard := make([]byte, length)
+				if _, err := io.ReadFull(br, discard); err != nil {
+					return err
+				}
+				errors.LogWarning(ctx, "anytls: unexpected data in SYN, streamId=", sid)
+				if err := sendFrame(cmdSYNACK, sid, []byte("unexpected syn body")); err != nil {
+					return err
+				}
 			}
 		case cmdPSH:
+			var body buf.MultiBuffer
+			if length > 0 {
+				var b *buf.Buffer
+				if length > buf.Size {
+					b = buf.NewWithSize(int32(length))
+				} else {
+					b = buf.New()
+				}
+				p := b.Extend(int32(length))
+				if _, err := io.ReadFull(br, p); err != nil {
+					b.Release()
+					return err
+				}
+				body = buf.MultiBuffer{b}
+			}
 			if err := s.handlePSH(ctx, sid, body, &streams, &smu, dispatcher, sendFrame); err != nil {
 				return err
 			}
 		case cmdFIN:
-			s.handleFIN(ctx, sid, &streams, &smu, bw)
+			if length > 0 {
+				discard := make([]byte, length)
+				if _, err := io.ReadFull(br, discard); err != nil {
+					return err
+				}
+			}
+			smu.Lock()
+			st := streams[sid]
+			smu.Unlock()
+			if st != nil && st.link != nil {
+				common.Close(st.link.Writer)
+				_ = bw.Flush()
+			}
 		default:
+			if length > 0 {
+				discard := make([]byte, length)
+				if _, err := io.ReadFull(br, discard); err != nil {
+					return err
+				}
+			}
 			errors.LogWarning(ctx, "anytls: unknown cmd=", cmd, " streamId=", sid)
 			return errors.New("anytls: unknown cmd")
 		}

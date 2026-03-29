@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
+	"io"
 	"sync"
 	"time"
 
@@ -120,7 +121,6 @@ func (o *Outbound) Process(ctx context.Context, link *transport.Link, dialer int
 	// 帧协议收发
 	br := &buf.BufferedReader{Reader: buf.NewReader(conn)}
 	bw := buf.NewBufferedWriter(buf.NewWriter(conn))
-	fr := newFrameReader(br, ctx)
 	fw := newFrameWriter(bw)
 	var writeMu sync.Mutex
 
@@ -257,50 +257,109 @@ func (o *Outbound) Process(ctx context.Context, link *transport.Link, dialer int
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
+		var head [7]byte
 		for {
-			cmd, rsid, data, err := fr.read()
+			_, err := io.ReadFull(br, head[:])
 			if err != nil {
 				return
 			}
+			cmd := head[0]
+			rsid := binary.BigEndian.Uint32(head[1:5])
+			length := int(binary.BigEndian.Uint16(head[5:7]))
+
 			switch cmd {
 			case cmdPSH:
-				// forward to local writer for matching sid; default to sid 1
-				if len(data) > 0 {
-					bb := buf.FromBytes(data)
-					_ = link.Writer.WriteMultiBuffer(buf.MultiBuffer{bb})
-					bb.Release()
+				var data buf.MultiBuffer
+				if length > 0 {
+					var b *buf.Buffer
+					if length <= buf.Size {
+						b = buf.New()
+					} else {
+						b = buf.NewWithSize(int32(length))
+					}
+					p := b.Extend(int32(length))
+					if _, err := io.ReadFull(br, p); err != nil {
+						b.Release()
+						return
+					}
+					data = buf.MultiBuffer{b}
+				}
+				if !data.IsEmpty() {
+					_ = link.Writer.WriteMultiBuffer(data)
 				}
 			case cmdFIN:
-				// remote closed stream -> close writer
-				// We don't maintain per-stream writer here; close the overall writer
+				if length > 0 {
+					discard := make([]byte, length)
+					if _, err := io.ReadFull(br, discard); err != nil {
+						return
+					}
+				}
 				common.Close(link.Writer)
 				return
 			case cmdSYNACK:
+				var body []byte
+				if length > 0 {
+					body = make([]byte, length)
+					if _, err := io.ReadFull(br, body); err != nil {
+						return
+					}
+				}
 				synAckMu.Lock()
 				ch := synAckCh[rsid]
 				synAckMu.Unlock()
 				if ch != nil {
-					if len(data) > 0 {
-						ch <- errors.New(string(data))
+					if len(body) > 0 {
+						ch <- errors.New(string(body))
 					} else {
 						ch <- nil
 					}
 				}
 			case cmdWaste:
+				if length > 0 {
+					discard := make([]byte, length)
+					if _, err := io.ReadFull(br, discard); err != nil {
+						return
+					}
+				}
 				continue
 			case cmdServerSettings:
+				if length > 0 {
+					discard := make([]byte, length)
+					if _, err := io.ReadFull(br, discard); err != nil {
+						return
+					}
+				}
 				// ignore for now
 			case cmdUpdatePaddingScheme:
-				// server sent padding scheme update during connection
-				scheme, perr := parsePaddingScheme(string(data))
-				if perr == nil && scheme != nil {
-					schemeMu.Lock()
-					paddingScheme = scheme
-					schemeMu.Unlock()
+				if length > 0 {
+					body := make([]byte, length)
+					if _, err := io.ReadFull(br, body); err != nil {
+						return
+					}
+					scheme, perr := parsePaddingScheme(string(body))
+					if perr == nil && scheme != nil {
+						schemeMu.Lock()
+						paddingScheme = scheme
+						schemeMu.Unlock()
+					}
 				}
 			case cmdHeartRequest:
-				// respond
+				if length > 0 {
+					discard := make([]byte, length)
+					if _, err := io.ReadFull(br, discard); err != nil {
+						return
+					}
+				}
 				_ = sendFrame(cmdHeartResponse, 0, nil)
+			default:
+				if length > 0 {
+					discard := make([]byte, length)
+					if _, err := io.ReadFull(br, discard); err != nil {
+						return
+					}
+				}
+				errors.LogWarning(ctx, "anytls: unknown cmd=", cmd, " streamId=", rsid)
+				return
 			}
 		}
 	}()
