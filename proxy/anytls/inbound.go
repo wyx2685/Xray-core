@@ -225,18 +225,11 @@ func (s *Server) Process(ctx context.Context, network xnet.Network, conn stat.Co
 		case cmdPSH:
 			var body buf.MultiBuffer
 			if length > 0 {
-				var b *buf.Buffer
-				if length > buf.Size {
-					b = buf.NewWithSize(int32(length))
-				} else {
-					b = buf.New()
-				}
-				p := b.Extend(int32(length))
-				if _, err := io.ReadFull(br, p); err != nil {
-					b.Release()
+				mb, err := readMultiBufferExact(br, length)
+				if err != nil {
 					return err
 				}
-				body = buf.MultiBuffer{b}
+				body = mb
 			}
 			if err := s.handlePSH(ctx, sid, body, &streams, &smu, dispatcher, sendFrame, sendDataFrame); err != nil {
 				return err
@@ -264,18 +257,4 @@ func (s *Server) Process(ctx context.Context, network xnet.Network, conn stat.Co
 			return errors.New("anytls: unknown cmd")
 		}
 	}
-}
-
-func discardBytes(br *buf.BufferedReader, length int) error {
-	var b *buf.Buffer
-	if length <= buf.Size {
-		b = buf.New()
-	} else {
-		b = buf.NewWithSize(int32(length))
-	}
-	defer b.Release()
-
-	p := b.Extend(int32(length))
-	_, err := io.ReadFull(br, p)
-	return err
 }
