@@ -4,9 +4,11 @@ import (
 	"encoding/binary"
 
 	"github.com/xtls/xray-core/common/buf"
+	"github.com/xtls/xray-core/common/errors"
 )
 
-const ( // cmds
+const (
+	// cmds
 	cmdWaste               = 0  // Paddings
 	cmdSYN                 = 1  // stream open
 	cmdPSH                 = 2  // data push
@@ -30,7 +32,12 @@ func newFrameWriter(bw *buf.BufferedWriter) *frameWriter {
 	return &frameWriter{bw: bw}
 }
 
+const maxFramePayload = 0xffff
+
 func (w *frameWriter) write(cmd byte, sid uint32, data []byte) error {
+	if len(data) > maxFramePayload {
+		return errors.New("anytls: frame payload too large")
+	}
 	w.header[0] = cmd
 	binary.BigEndian.PutUint32(w.header[1:5], sid)
 	binary.BigEndian.PutUint16(w.header[5:7], uint16(len(data)))
@@ -51,6 +58,24 @@ func (w *frameWriter) write(cmd byte, sid uint32, data []byte) error {
 	}
 
 	return nil
+}
+
+func (w *frameWriter) writeMultiBuffer(cmd byte, sid uint32, mb buf.MultiBuffer) error {
+	if mb.IsEmpty() {
+		return nil
+	}
+	if mb.Len() > maxFramePayload {
+		return errors.New("anytls: frame payload too large")
+	}
+	w.header[0] = cmd
+	binary.BigEndian.PutUint32(w.header[1:5], sid)
+	binary.BigEndian.PutUint16(w.header[5:7], uint16(mb.Len()))
+
+	if _, err := w.bw.Write(w.header[:]); err != nil {
+		return err
+	}
+
+	return w.bw.WriteMultiBuffer(mb)
 }
 
 func (w *frameWriter) flush() error {

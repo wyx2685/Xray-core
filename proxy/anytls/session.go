@@ -13,7 +13,7 @@ import (
 	"github.com/xtls/xray-core/transport"
 )
 
-func (s *Server) handlePSH(ctx context.Context, sid uint32, body buf.MultiBuffer, streams *map[uint32]*stream, smu *sync.Mutex, dispatcher routing.Dispatcher, sendFrame func(byte, uint32, []byte) error) error {
+func (s *Server) handlePSH(ctx context.Context, sid uint32, body buf.MultiBuffer, streams *map[uint32]*stream, smu *sync.Mutex, dispatcher routing.Dispatcher, sendFrame func(byte, uint32, []byte) error, sendData func(uint32, buf.MultiBuffer) error) error {
 	if body.IsEmpty() {
 		return nil
 	}
@@ -23,12 +23,12 @@ func (s *Server) handlePSH(ctx context.Context, sid uint32, body buf.MultiBuffer
 	smu.Unlock()
 
 	if st == nil {
-		return s.handleLazyConnect(ctx, sid, body, streams, smu, dispatcher, sendFrame)
+		return s.handleLazyConnect(ctx, sid, body, streams, smu, dispatcher, sendFrame, sendData)
 	}
 
 	// Handle UDP-over-TCP v2 stream
 	if st.isUDP {
-		return s.handleUDPStream(ctx, sid, body, st, streams, smu, dispatcher, sendFrame)
+		return s.handleUDPStream(ctx, sid, body, st, streams, smu, dispatcher, sendFrame, sendData)
 	}
 
 	// Normal TCP stream, forward data
@@ -42,7 +42,7 @@ func (s *Server) handlePSH(ctx context.Context, sid uint32, body buf.MultiBuffer
 	return nil
 }
 
-func (s *Server) handleLazyConnect(ctx context.Context, sid uint32, body buf.MultiBuffer, streams *map[uint32]*stream, smu *sync.Mutex, dispatcher routing.Dispatcher, sendFrame func(byte, uint32, []byte) error) error {
+func (s *Server) handleLazyConnect(ctx context.Context, sid uint32, body buf.MultiBuffer, streams *map[uint32]*stream, smu *sync.Mutex, dispatcher routing.Dispatcher, sendFrame func(byte, uint32, []byte) error, sendData func(uint32, buf.MultiBuffer) error) error {
 	peekLen := int(body.Len())
 	if peekLen > 259 {
 		peekLen = 259
@@ -101,11 +101,11 @@ func (s *Server) handleLazyConnect(ctx context.Context, sid uint32, body buf.Mul
 	buf.ReleaseMulti(body)
 
 	// Start downlink pump
-	go s.pumpDownlink(ctx, sid, l, streams, smu, sendFrame)
+	go s.pumpDownlink(ctx, sid, l, streams, smu, sendFrame, sendData)
 	return nil
 }
 
-func (s *Server) handleUDPStream(ctx context.Context, sid uint32, body buf.MultiBuffer, st *stream, streams *map[uint32]*stream, smu *sync.Mutex, dispatcher routing.Dispatcher, sendFrame func(byte, uint32, []byte) error) error {
+func (s *Server) handleUDPStream(ctx context.Context, sid uint32, body buf.MultiBuffer, st *stream, streams *map[uint32]*stream, smu *sync.Mutex, dispatcher routing.Dispatcher, sendFrame func(byte, uint32, []byte) error, sendData func(uint32, buf.MultiBuffer) error) error {
 	// First PSH in UDP stream contains: uot.Request (IsConnect + Destination) + first UDP packet
 	// Format: IsConnect(1) + SOCKS_ATYP(1) + Address(variable) + Port(2) + [SOCKS_ATYP + Address + Port + Length(2) + Data]
 	if st.link == nil {
@@ -204,7 +204,7 @@ func (s *Server) handleUDPStream(ctx context.Context, sid uint32, body buf.Multi
 		st.isConnect = isConnect
 
 		// Start UDP relay goroutine (downlink: UDP -> TCP stream)
-		go s.pumpDownlink(ctx, sid, link, streams, smu, sendFrame)
+		go s.pumpDownlink(ctx, sid, link, streams, smu, sendFrame, sendData)
 
 		// Forward all available UDP payload data
 		// Note: UDP packets may be split across multiple ANYTLS frames
@@ -242,7 +242,7 @@ func (s *Server) handleUDPStream(ctx context.Context, sid uint32, body buf.Multi
 	return nil
 }
 
-func (s *Server) pumpDownlink(ctx context.Context, sid uint32, link *transport.Link, streams *map[uint32]*stream, smu *sync.Mutex, sendFrame func(byte, uint32, []byte) error) {
+func (s *Server) pumpDownlink(ctx context.Context, sid uint32, link *transport.Link, streams *map[uint32]*stream, smu *sync.Mutex, sendControl func(byte, uint32, []byte) error, sendData func(uint32, buf.MultiBuffer) error) {
 	defer func() {
 		smu.Lock()
 		st := (*streams)[sid]
@@ -252,7 +252,7 @@ func (s *Server) pumpDownlink(ctx context.Context, sid uint32, link *transport.L
 			common.Close(st.link.Writer)
 			common.Close(st.link.Reader)
 		}
-		_ = sendFrame(cmdFIN, sid, nil)
+		_ = sendControl(cmdFIN, sid, nil)
 	}()
 
 	for {
@@ -261,16 +261,12 @@ func (s *Server) pumpDownlink(ctx context.Context, sid uint32, link *transport.L
 			break
 		}
 
-		// Optimization: send all buffers in the batch
-		// The sendFrame function will flush each time, but this is necessary
-		// to ensure data is sent promptly. The OS will batch the writes.
-		for _, b := range mb {
-			if err := sendFrame(cmdPSH, sid, b.Bytes()); err != nil {
-				b.Release()
+		for !mb.IsEmpty() {
+			mb, chunk := buf.SplitSize(mb, maxFramePayload)
+			if err := sendData(sid, chunk); err != nil {
 				buf.ReleaseMulti(mb)
 				return
 			}
-			b.Release()
 		}
 	}
 }

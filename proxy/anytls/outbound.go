@@ -138,7 +138,7 @@ func (o *Outbound) Process(ctx context.Context, link *transport.Link, dialer int
 	// 缓冲区用于合并 cmdSettings + cmdSYN 作为包1
 	var frameBuffer []byte
 
-	// helper to send frames with serialization (支持缓冲)
+	// helper to send control frames immediately
 	sendFrame := func(cmd byte, sid uint32, data []byte) error {
 		writeMu.Lock()
 		defer writeMu.Unlock()
@@ -146,6 +146,18 @@ func (o *Outbound) Process(ctx context.Context, link *transport.Link, dialer int
 			return err
 		}
 		return fw.flush()
+	}
+
+	// helper to send data frames without immediate flush
+	sendDataFrame := func(sid uint32, data buf.MultiBuffer) error {
+		writeMu.Lock()
+		defer writeMu.Unlock()
+		return fw.writeMultiBuffer(cmdPSH, sid, data)
+	}
+
+	// helper to send byte slice data frames without immediate flush
+	sendDataFrameBytes := func(sid uint32, data []byte) error {
+		return sendDataFrame(sid, buf.MultiBuffer{buf.FromBytes(data)})
 	}
 
 	// buffered frame writer - 用于合并 cmdSettings + cmdSYN
@@ -433,7 +445,7 @@ func (o *Outbound) Process(ctx context.Context, link *transport.Link, dialer int
 		if err := uot.WriteRequest(reqBuf, uotReq); err != nil {
 			return errors.New("anytls: write UoT request failed").Base(err)
 		}
-		if err := sendFrame(cmdPSH, mySid, reqBuf.Bytes()); err != nil {
+		if err := sendDataFrameBytes(mySid, reqBuf.Bytes()); err != nil {
 			reqBuf.Release()
 			return errors.New("anytls: send UoT request failed").Base(err)
 		}
@@ -445,9 +457,8 @@ func (o *Outbound) Process(ctx context.Context, link *transport.Link, dialer int
 	// 注意：包1 已经在 cmdSettings+cmdSYN 中处理，这里从包2开始
 	go func(sid uint32) {
 		for {
-			b := make([]byte, 8192)
-			n, err := lbr.Read(b)
-			if n > 0 {
+			mb, err := lbr.ReadMultiBuffer()
+			if !mb.IsEmpty() {
 				// 获取当前包序号
 				pktMu.Lock()
 				packetIndex := int(pktCounter)
@@ -459,31 +470,19 @@ func (o *Outbound) Process(ctx context.Context, link *transport.Link, dialer int
 				scheme := paddingScheme
 				schemeMu.RUnlock()
 
-				data := b[:n]
-
-				// 如果有 padding scheme 且未超过 stop 限制，应用规则
 				if scheme != nil && uint32(packetIndex) < scheme.stop {
-					// 使用官方简洁 API 生成分片大小
 					pktSizes := scheme.GenerateRecordPayloadSizes(uint32(packetIndex))
-
 					if len(pktSizes) > 0 {
-						// 按照生成的 sizes 发送数据
-						offset := 0
 						for _, size := range pktSizes {
-							// 处理 CheckMark
 							if size == CheckMark {
-								// 检查是否还有剩余数据
-								if offset >= len(data) {
-									// 没有剩余数据，停止发送（不发填充）
+								if mb.IsEmpty() {
 									break
 								}
 								continue
 							}
 
-							remaining := len(data) - offset
-
+							remaining := int(mb.Len())
 							if remaining <= 0 {
-								// 数据已发送完，发送填充包 (cmdWaste)
 								wastePad := make([]byte, size)
 								if werr := sendFrame(cmdWaste, 0, wastePad); werr != nil {
 									_ = sendFrame(cmdFIN, sid, nil)
@@ -492,40 +491,37 @@ func (o *Outbound) Process(ctx context.Context, link *transport.Link, dialer int
 								continue
 							}
 
-							// 有剩余数据，准备发送
-							var chunkData []byte
 							if remaining >= size {
-								// 数据足够，发送指定大小
-								chunkData = data[offset : offset+size]
-								offset += size
-							} else {
-								// 数据不足，全部发送（可能需要填充）
-								chunkData = make([]byte, size)
-								copy(chunkData, data[offset:])
-								offset = len(data)
+								var chunk buf.MultiBuffer
+								mb, chunk = buf.SplitSize(mb, int32(size))
+								if werr := sendDataFrame(sid, chunk); werr != nil {
+									buf.ReleaseMulti(mb)
+									return
+								}
+								continue
 							}
 
-							// 发送数据分片
-							if werr := sendFrame(cmdPSH, sid, chunkData); werr != nil {
-								_ = sendFrame(cmdFIN, sid, nil)
+							var chunk buf.MultiBuffer
+							mb, chunk = buf.SplitSize(mb, int32(remaining))
+							pad := buf.NewWithSize(int32(size - remaining))
+							pad.Extend(int32(size - remaining))
+							chunk = append(chunk, pad)
+							if werr := sendDataFrame(sid, chunk); werr != nil {
+								buf.ReleaseMulti(mb)
 								return
 							}
 						}
 
-						// 如果还有剩余数据，直接发送
-						if offset < len(data) {
-							if werr := sendFrame(cmdPSH, sid, data[offset:]); werr != nil {
-								_ = sendFrame(cmdFIN, sid, nil)
+						if !mb.IsEmpty() {
+							if werr := sendDataFrame(sid, mb); werr != nil {
 								return
 							}
 						}
-
 						continue
 					}
 				}
 
-				// 没有 padding scheme 或超出 stop 范围，直接发送原始数据
-				if werr := sendFrame(cmdPSH, sid, data); werr != nil {
+				if err := sendDataFrame(sid, mb); err != nil {
 					_ = sendFrame(cmdFIN, sid, nil)
 					return
 				}
