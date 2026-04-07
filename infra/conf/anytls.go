@@ -47,11 +47,14 @@ func (c *AnyTLSServerConfig) Build() (proto.Message, error) {
 }
 
 type AnyTLSClientConfig struct {
-	Address  *Address `json:"address"`
-	Port     uint16   `json:"port"`
-	Email    string   `json:"email"`
-	Password string   `json:"password"`
-	Level    uint32   `json:"level"`
+	Address                  *Address `json:"address"`
+	Port                     uint16   `json:"port"`
+	Email                    string   `json:"email"`
+	Password                 string   `json:"password"`
+	Level                    uint32   `json:"level"`
+	IdleSessionCheckInterval uint32   `json:"idleSessionCheckInterval"` // seconds
+	IdleSessionTimeout       uint32   `json:"idleSessionTimeout"`       // seconds
+	MinIdleSession           int      `json:"minIdleSession"`
 }
 
 func (c *AnyTLSClientConfig) Build() (proto.Message, error) {
@@ -74,7 +77,13 @@ func (c *AnyTLSClientConfig) Build() (proto.Message, error) {
 				}),
 			},
 		},
+		IdleSessionCheckInterval: c.IdleSessionCheckInterval,
+		IdleSessionTimeout:       c.IdleSessionTimeout,
 	}
+	if c.MinIdleSession < 0 {
+		return nil, errors.New("ANYTLS: minIdleSession must be non-negative")
+	}
+	cfg.MinIdleSession = uint32(c.MinIdleSession)
 
 	return cfg, nil
 }

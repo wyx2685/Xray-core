@@ -21,22 +21,19 @@ var defaultPaddingScheme = []byte(`stop=8
 6=500-1000
 7=500-1000`)
 
-// paddingScheme 存储 padding 配置（采用官方简洁风格）
 type paddingScheme struct {
-	rawScheme []byte            // 原始 scheme 字符串
-	scheme    map[string]string // key-value 映射
-	stop      uint32            // 停止应用 padding 的包序号
-	md5       string            // scheme 的 MD5 值（小写 hex）
+	rawScheme []byte
+	scheme    map[string]string
+	stop      uint32
+	md5       string
 }
 
-// newPaddingScheme 从原始字节创建 paddingScheme
 func newPaddingScheme(rawScheme []byte) *paddingScheme {
 	p := &paddingScheme{
 		rawScheme: rawScheme,
 		md5:       fmt.Sprintf("%x", md5.Sum(rawScheme)),
 	}
 
-	// 解析为 key-value map
 	scheme := make(map[string]string)
 	lines := strings.Split(string(rawScheme), "\n")
 	for _, line := range lines {
@@ -54,7 +51,6 @@ func newPaddingScheme(rawScheme []byte) *paddingScheme {
 		return nil
 	}
 
-	// 解析 stop 字段
 	if stop, err := strconv.Atoi(scheme["stop"]); err == nil {
 		p.stop = uint32(stop)
 	} else {
@@ -65,12 +61,10 @@ func newPaddingScheme(rawScheme []byte) *paddingScheme {
 	return p
 }
 
-// getDefaultPaddingScheme 返回默认的 padding scheme
 func getDefaultPaddingScheme() *paddingScheme {
 	return newPaddingScheme(defaultPaddingScheme)
 }
 
-// parsePaddingScheme 解析服务器发送的 padding scheme 字符串
 func parsePaddingScheme(schemeStr string) (*paddingScheme, error) {
 	if schemeStr == "" {
 		return nil, nil
@@ -78,8 +72,6 @@ func parsePaddingScheme(schemeStr string) (*paddingScheme, error) {
 	return newPaddingScheme([]byte(schemeStr)), nil
 }
 
-// GenerateRecordPayloadSizes 生成指定包序号的所有分片大小
-// 返回的 slice 中，CheckMark (-1) 表示条件检查点
 func (p *paddingScheme) GenerateRecordPayloadSizes(pkt uint32) []int {
 	if p == nil {
 		return nil
@@ -92,18 +84,15 @@ func (p *paddingScheme) GenerateRecordPayloadSizes(pkt uint32) []int {
 		return pktSizes
 	}
 
-	// 分割规则：例如 "400-500,c,500-1000,c,500-1000"
 	sRanges := strings.Split(s, ",")
 	for _, sRange := range sRanges {
 		sRange = strings.TrimSpace(sRange)
 
-		// 检查是否是 CheckMark
 		if sRange == "c" {
 			pktSizes = append(pktSizes, CheckMark)
 			continue
 		}
 
-		// 解析 "min-max"
 		sRangeMinMax := strings.Split(sRange, "-")
 		if len(sRangeMinMax) != 2 {
 			continue
@@ -118,7 +107,6 @@ func (p *paddingScheme) GenerateRecordPayloadSizes(pkt uint32) []int {
 			continue
 		}
 
-		// 确保 min <= max
 		if _min > _max {
 			_min, _max = _max, _min
 		}
@@ -127,7 +115,6 @@ func (p *paddingScheme) GenerateRecordPayloadSizes(pkt uint32) []int {
 			continue
 		}
 
-		// 生成随机大小
 		if _min == _max {
 			pktSizes = append(pktSizes, int(_min))
 		} else {
@@ -139,10 +126,9 @@ func (p *paddingScheme) GenerateRecordPayloadSizes(pkt uint32) []int {
 	return pktSizes
 }
 
-// getPadding0Size 获取包0（认证阶段）的 padding 大小
 func getPadding0Size(scheme *paddingScheme) uint16 {
 	if scheme == nil {
-		return 30 // 默认值
+		return 30
 	}
 
 	sizes := scheme.GenerateRecordPayloadSizes(0)
@@ -150,5 +136,5 @@ func getPadding0Size(scheme *paddingScheme) uint16 {
 		return uint16(sizes[0])
 	}
 
-	return 30 // 默认值
+	return 30
 }

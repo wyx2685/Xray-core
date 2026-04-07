@@ -22,5 +22,7 @@ message ServerConfig {
 
 message ClientConfig {
   xray.common.protocol.ServerEndpoint server = 1;  // 单个服务器地址，不使用列表
-  // client options if needed later (keep empty for now)
+  uint32 idleSessionCheckInterval = 2; // optional, seconds
+  uint32 idleSessionTimeout = 3;       // optional, seconds
+  uint32 minIdleSession = 4;          // optional
 }

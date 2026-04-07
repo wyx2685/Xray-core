@@ -22,6 +22,54 @@ const (
 	cmdServerSettings      = 10 // Settings (Server send to client)
 )
 
+type frame struct {
+	cmd  byte
+	sid  uint32
+	data []byte
+}
+
+func newFrame(cmd byte, sid uint32) *frame {
+	return &frame{cmd: cmd, sid: sid}
+}
+
+func (f *frame) toMultiBuffer() buf.MultiBuffer {
+	hdr := buf.New()
+	hdrb := hdr.Extend(7)
+	hdrb[0] = f.cmd
+	binary.BigEndian.PutUint32(hdrb[1:5], f.sid)
+	length := len(f.data)
+	binary.BigEndian.PutUint16(hdrb[5:7], uint16(length))
+	var mb buf.MultiBuffer
+	if length > 0 {
+		body := buf.New()
+		bodyb := body.Extend(int32(length))
+		copy(bodyb, f.data)
+		mb = buf.MultiBuffer{hdr, body}
+	} else {
+		mb = buf.MultiBuffer{hdr}
+	}
+
+	return mb
+}
+
+func (f *frame) toMultiBufferWithBody(body *buf.Buffer) buf.MultiBuffer {
+	hdr := buf.New()
+	hdrb := hdr.Extend(7)
+	hdrb[0] = f.cmd
+	binary.BigEndian.PutUint32(hdrb[1:5], f.sid)
+	if body == nil {
+		binary.BigEndian.PutUint16(hdrb[5:7], 0)
+		return buf.MultiBuffer{hdr}
+	}
+	length := int(body.Len())
+	binary.BigEndian.PutUint16(hdrb[5:7], uint16(length))
+	if length == 0 {
+		body.Release()
+		return buf.MultiBuffer{hdr}
+	}
+	return buf.MultiBuffer{hdr, body}
+}
+
 // frameWriter handles writing ANYTLS protocol frames
 type frameWriter struct {
 	bw     *buf.BufferedWriter
@@ -34,26 +82,29 @@ func newFrameWriter(bw *buf.BufferedWriter) *frameWriter {
 
 const maxFramePayload = 0xffff
 
-func (w *frameWriter) write(cmd byte, sid uint32, data []byte) error {
-	if len(data) > maxFramePayload {
+func (w *frameWriter) writeFrame(f *frame) error {
+	if f == nil {
+		return nil
+	}
+	if len(f.data) > maxFramePayload {
 		return errors.New("anytls: frame payload too large")
 	}
-	w.header[0] = cmd
-	binary.BigEndian.PutUint32(w.header[1:5], sid)
-	binary.BigEndian.PutUint16(w.header[5:7], uint16(len(data)))
+	w.header[0] = f.cmd
+	binary.BigEndian.PutUint32(w.header[1:5], f.sid)
+	binary.BigEndian.PutUint16(w.header[5:7], uint16(len(f.data)))
 
 	if _, err := w.bw.Write(w.header[:]); err != nil {
 		return err
 	}
 
-	if len(data) > 0 {
+	if len(f.data) > 0 {
 		// Flush header first if data is large (>= 8KB)
-		if len(data) >= 8192 {
+		if len(f.data) >= 8192 {
 			if err := w.bw.Flush(); err != nil {
 				return err
 			}
 		}
-		_, err := w.bw.Write(data)
+		_, err := w.bw.Write(f.data)
 		return err
 	}
 

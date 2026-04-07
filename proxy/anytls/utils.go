@@ -1,105 +1,69 @@
 package anytls
 
 import (
-	"encoding/binary"
+	"io"
 
-	"github.com/xtls/xray-core/common/errors"
-	xnet "github.com/xtls/xray-core/common/net"
-	"github.com/xtls/xray-core/transport"
+	"github.com/xtls/xray-core/common/buf"
 )
 
-// stream represents a single ANYTLS stream
-type stream struct {
-	link      *transport.Link
-	isUDP     bool
-	udpTarget *xnet.Destination
-	isConnect bool // for UDP-over-TCP: true = fixed destination, false = per-packet destination
+func readMultiBufferExact(br *buf.BufferedReader, length int) (buf.MultiBuffer, error) {
+	var mb buf.MultiBuffer
+	remaining := length
+
+	for remaining > 0 {
+		b := buf.New()
+
+		size := buf.Size
+		if remaining < size {
+			size = remaining
+		}
+
+		p := b.Extend(int32(size))
+
+		if _, err := io.ReadFull(br, p); err != nil {
+			b.Release()
+			buf.ReleaseMulti(mb)
+			return nil, err
+		}
+
+		mb = append(mb, b)
+		remaining -= size
+	}
+
+	return mb, nil
 }
 
-// parseUotAddr parses a UDP-over-TCP address format (ATYP 0/1/2)
-// Returns UDPDestination for packet routing
-func parseUotAddr(b []byte) (xnet.Destination, int, error) {
-	if len(b) < 1 {
-		return xnet.Destination{}, 0, errors.New("anytls: empty addr")
+func discardBytes(br *buf.BufferedReader, length int) error {
+	remaining := length
+	b := buf.New()
+	defer b.Release()
+	for remaining > 0 {
+		size := buf.Size
+		if remaining < size {
+			size = remaining
+		}
+		b.Clear()
+		p := b.Extend(int32(size))
+		if _, err := io.ReadFull(br, p); err != nil {
+			b.Release()
+			return err
+		}
+		remaining -= size
 	}
-	atyp := b[0]
-	p := 1
-	var addr xnet.Address
-	switch atyp {
-	case 0x00: // IPv4
-		if len(b) < p+4+2 {
-			return xnet.Destination{}, 0, errors.New("anytls: short ipv4 addr")
-		}
-		addr = xnet.IPAddress(b[p : p+4])
-		p += 4
-	case 0x01: // IPv6
-		if len(b) < p+16+2 {
-			return xnet.Destination{}, 0, errors.New("anytls: short ipv6 addr")
-		}
-		addr = xnet.IPAddress(b[p : p+16])
-		p += 16
-	case 0x02: // Domain
-		if len(b) < p+1 {
-			return xnet.Destination{}, 0, errors.New("anytls: short domain len")
-		}
-		l := int(b[p])
-		p++
-		if len(b) < p+l+2 {
-			return xnet.Destination{}, 0, errors.New("anytls: short domain addr")
-		}
-		addr = xnet.DomainAddress(string(b[p : p+l]))
-		p += l
-	default:
-		return xnet.Destination{}, 0, errors.New("anytls: bad uot atyp")
-	}
-	port := xnet.Port(binary.BigEndian.Uint16(b[p : p+2]))
-	p += 2
-
-	return xnet.UDPDestination(addr, port), p, nil
+	return nil
 }
 
-// parseSocksAddr parses a SOCKS address format (ATYP 1/3/4)
-// Returns TCPDestination for compatibility with existing code
-func parseSocksAddr(b []byte) (xnet.Destination, int, error) {
-	if len(b) < 1 {
-		return xnet.Destination{}, 0, errors.New("anytls: empty addr")
+func readText(br *buf.BufferedReader, length int) (string, error) {
+	if length <= 0 {
+		return "", nil
 	}
-	atyp := b[0]
-	p := 1
-	var addr xnet.Address
-	switch atyp {
-	case 1: // IPv4
-		if len(b) < p+4+2 {
-			return xnet.Destination{}, 0, errors.New("anytls: short ipv4 addr")
-		}
-		addr = xnet.IPAddress(b[p : p+4])
-		p += 4
-	case 3: // Domain
-		if len(b) < p+1 {
-			return xnet.Destination{}, 0, errors.New("anytls: short domain len")
-		}
-		l := int(b[p])
-		p++
-		if len(b) < p+l+2 {
-			return xnet.Destination{}, 0, errors.New("anytls: short domain addr")
-		}
-		addr = xnet.DomainAddress(string(b[p : p+l]))
-		p += l
-	case 4: // IPv6
-		if len(b) < p+16+2 {
-			return xnet.Destination{}, 0, errors.New("anytls: short ipv6 addr")
-		}
-		addr = xnet.IPAddress(b[p : p+16])
-		p += 16
-	default:
-		return xnet.Destination{}, 0, errors.New("anytls: bad atyp")
+	body := buf.New()
+	bodyBytes := body.Extend(int32(length))
+	if _, err := io.ReadFull(br, bodyBytes); err != nil {
+		body.Release()
+		return "", err
 	}
-	port := xnet.Port(binary.BigEndian.Uint16(b[p : p+2]))
-	p += 2
-
-	// Always return TCP destination
-	// UDP-over-TCP v2 uses a special magic domain "sp.v2.udp-over-tcp.arpa"
-	// The actual UDP target address is embedded in the subsequent data stream
-	// following the UDP-over-TCP v2 protocol format
-	return xnet.TCPDestination(addr, port), p, nil
+	text := string(bodyBytes)
+	body.Release()
+	return text, nil
 }
