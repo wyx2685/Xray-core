@@ -1,6 +1,7 @@
 package anytls
 
 import (
+	"bytes"
 	"context"
 	"crypto/md5"
 	"encoding/binary"
@@ -78,8 +79,14 @@ func (s *session) handlePSH(ctx context.Context, st *stream, br *buf.BufferedRea
 	return nil
 }
 
-func (s *session) handleNewStream(ctx context.Context, st *stream, br *buf.BufferedReader) error {
-	addr, err := M.SocksaddrSerializer.ReadAddrPort(br)
+func (s *session) handleNewStream(ctx context.Context, st *stream, br *buf.BufferedReader, length int) error {
+	body := make([]byte, length)
+	if _, err := io.ReadFull(br, body); err != nil {
+		return err
+	}
+
+	reader := bytes.NewReader(body)
+	addr, err := M.SocksaddrSerializer.ReadAddrPort(reader)
 	if err != nil {
 		return err
 	}
@@ -108,6 +115,18 @@ func (s *session) handleNewStream(ctx context.Context, st *stream, br *buf.Buffe
 	if err := s.sendFrame(newFrame(cmdSYNACK, st.sid)); err != nil {
 		errors.LogWarning(ctx, "anytls: new stream SYNACK send error, streamId=", st.sid, " err=", err)
 		return err
+	}
+
+	if reader.Len() > 0 {
+		remainingData, err := io.ReadAll(reader)
+		if err != nil {
+			return err
+		}
+		if len(remainingData) > 0 {
+			if err := l.Writer.WriteMultiBuffer(buf.MultiBuffer{buf.FromBytes(remainingData)}); err != nil {
+				return err
+			}
+		}
 	}
 
 	go s.pumpDownlink(st.sid, l)
@@ -398,7 +417,9 @@ func (s *session) readLoop(ctx context.Context) error {
 				}
 				continue
 			} else if st.link == nil {
-				s.handleNewStream(ctx, st, s.br)
+				if err := s.handleNewStream(ctx, st, s.br, length); err != nil {
+					return err
+				}
 				continue
 			}
 			if err := s.handlePSH(ctx, st, s.br, length); err != nil {
