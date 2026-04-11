@@ -8,7 +8,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/protocol"
@@ -26,12 +25,6 @@ const (
 	defaultIdleSessionTimeout       = 60 * time.Second
 	defaultMinIdleSession           = 0
 )
-
-func init() {
-	common.Must(common.RegisterConfig((*ClientConfig)(nil), func(ctx context.Context, config interface{}) (interface{}, error) {
-		return NewClient(ctx, config.(*ClientConfig))
-	}))
-}
 
 // Client is the anytls outbound proxy handler.
 type Client struct {

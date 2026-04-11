@@ -62,29 +62,27 @@ type session struct {
 	dieHook       func()
 }
 
-func (s *session) handlePSH(ctx context.Context, st *stream, br *buf.BufferedReader, length int) error {
-	if st == nil || st.link == nil {
-		return errors.New("anytls: received PSH for unknown stream")
-	}
-	body, err := readMultiBufferExact(br, length)
-	if err != nil {
-		buf.ReleaseMulti(body)
-		return err
+func (s *session) handleNewStream(ctx context.Context, st *stream, body buf.MultiBuffer) error {
+	var first *buf.Buffer
+	body, first = buf.SplitFirst(body)
+	if first == nil {
+		return errors.New("anytls: missing destination address in PSH")
 	}
 
-	if err := st.link.Writer.WriteMultiBuffer(body); err != nil {
+	addr, err := M.SocksaddrSerializer.ReadAddrPort(first)
+	if err != nil {
+		first.Release()
 		return err
 	}
-	return nil
-}
-
-func (s *session) handleNewStream(ctx context.Context, st *stream, br *buf.BufferedReader) error {
-	addr, err := M.SocksaddrSerializer.ReadAddrPort(br)
-	if err != nil {
-		return err
+	if !first.IsEmpty() {
+		body = append(buf.MultiBuffer{first}, body...)
+		first = nil
+	} else {
+		first.Release()
 	}
 	dest := singbridge.ToDestination(addr, net.Network_TCP)
 	if dest.Address == nil {
+		buf.ReleaseMulti(body)
 		return errors.New("anytls: invalid destination address in SYN")
 	}
 
@@ -94,6 +92,9 @@ func (s *session) handleNewStream(ctx context.Context, st *stream, br *buf.Buffe
 		if err := s.sendFrame(newFrame(cmdSYNACK, st.sid)); err != nil {
 			errors.LogWarning(ctx, "anytls: UDP SYNACK send error, streamId=", st.sid, " err=", err)
 			return err
+		}
+		if !body.IsEmpty() {
+			return s.handleFirstUDPFrame(ctx, st, body)
 		}
 		return nil
 	}
@@ -109,19 +110,40 @@ func (s *session) handleNewStream(ctx context.Context, st *stream, br *buf.Buffe
 		errors.LogWarning(ctx, "anytls: new stream SYNACK send error, streamId=", st.sid, " err=", err)
 		return err
 	}
+	if !body.IsEmpty() {
+		if err := st.link.Writer.WriteMultiBuffer(body); err != nil {
+			return err
+		}
+	}
 
 	go s.pumpDownlink(st.sid, l)
 	return nil
 }
 
-func (s *session) handleFirstUDPFrame(ctx context.Context, st *stream, br *buf.BufferedReader) error {
+func (s *session) handleFirstUDPFrame(ctx context.Context, st *stream, body buf.MultiBuffer) error {
 	if st.link == nil {
-		request, err := uot.ReadRequest(br)
+		var first *buf.Buffer
+		body, first = buf.SplitFirst(body)
+		if first == nil {
+			errors.LogWarning(ctx, "anytls: UDP missing request data")
+			_ = s.sendFrame(newFrame(cmdFIN, st.sid))
+			s.finishStream(st.sid, nil)
+			return nil
+		}
+
+		request, err := uot.ReadRequest(first)
 		if err != nil {
+			first.Release()
 			errors.LogWarning(ctx, "anytls: UDP failed to parse request:", err)
 			_ = s.sendFrame(newFrame(cmdFIN, st.sid))
 			s.finishStream(st.sid, nil)
 			return nil
+		}
+		if !first.IsEmpty() {
+			body = append(buf.MultiBuffer{first}, body...)
+			first = nil
+		} else {
+			first.Release()
 		}
 		requestDest := singbridge.ToDestination(request.Destination, net.Network_UDP)
 
@@ -135,11 +157,19 @@ func (s *session) handleFirstUDPFrame(ctx context.Context, st *stream, br *buf.B
 
 		st.link = link
 		st.udpTarget = &requestDest
+		if !body.IsEmpty() {
+			if err := st.link.Writer.WriteMultiBuffer(body); err != nil {
+				return err
+			}
+		}
 
 		go s.pumpDownlink(st.sid, link)
 		return nil
 	}
 
+	if err := st.link.Writer.WriteMultiBuffer(body); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -385,23 +415,30 @@ func (s *session) readLoop(ctx context.Context) error {
 				s.finishStream(sid, err)
 				return err
 			}
+			body, err := readMultiBufferExact(s.br, length)
+			if err != nil {
+				return err
+			}
 			s.streamsMu.Lock()
 			st := s.streams[sid]
 			s.streamsMu.Unlock()
 			if st == nil {
 				err := errors.New("anytls: received PSH for unknown stream, streamId=", sid)
+				buf.ReleaseMulti(body)
 				s.finishStream(sid, err)
 				return nil
 			} else if st.isUDP && st.link == nil {
-				if err := s.handleFirstUDPFrame(ctx, st, s.br); err != nil {
+				if err := s.handleFirstUDPFrame(ctx, st, body); err != nil {
 					return err
 				}
 				continue
 			} else if st.link == nil {
-				s.handleNewStream(ctx, st, s.br)
+				if err := s.handleNewStream(ctx, st, body); err != nil {
+					return err
+				}
 				continue
 			}
-			if err := s.handlePSH(ctx, st, s.br, length); err != nil {
+			if err := st.link.Writer.WriteMultiBuffer(body); err != nil {
 				return err
 			}
 		case cmdFIN:
