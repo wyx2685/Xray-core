@@ -23,6 +23,7 @@ import (
 	"github.com/xtls/xray-core/transport/internet"
 	"github.com/xtls/xray-core/transport/internet/finalmask"
 	"github.com/xtls/xray-core/transport/internet/hysteria/congestion"
+	"github.com/xtls/xray-core/transport/internet/hysteria/congestion/bbr"
 	"github.com/xtls/xray-core/transport/internet/hysteria/udphop"
 	"github.com/xtls/xray-core/transport/internet/stat"
 	"github.com/xtls/xray-core/transport/internet/tls"
@@ -157,10 +158,10 @@ func (c *client) dial() error {
 
 	quicParams := c.quicParams
 	if quicParams == nil {
-		quicParams = &internet.QuicParams{}
-	}
-	if quicParams.UdpHop == nil {
-		quicParams.UdpHop = &internet.UdpHop{}
+		quicParams = &internet.QuicParams{
+			BbrProfile: string(bbr.ProfileStandard),
+			UdpHop:     &internet.UdpHop{},
+		}
 	}
 
 	var index int
@@ -298,12 +299,12 @@ func (c *client) dial() error {
 	case "reno":
 		errors.LogDebug(c.ctx, "congestion reno")
 	case "bbr":
-		errors.LogDebug(c.ctx, "congestion bbr")
-		congestion.UseBBR(quicConn)
+		errors.LogDebug(c.ctx, "congestion bbr ", quicParams.BbrProfile)
+		congestion.UseBBR(quicConn, bbr.Profile(quicParams.BbrProfile))
 	case "brutal", "":
 		if serverAuto == "auto" || quicParams.BrutalUp == 0 || serverDown == 0 {
-			errors.LogDebug(c.ctx, "congestion bbr")
-			congestion.UseBBR(quicConn)
+			errors.LogDebug(c.ctx, "congestion bbr ", quicParams.BbrProfile)
+			congestion.UseBBR(quicConn, bbr.Profile(quicParams.BbrProfile))
 		} else {
 			errors.LogDebug(c.ctx, "congestion brutal bytes per second ", min(quicParams.BrutalUp, serverDown))
 			congestion.UseBrutal(quicConn, min(quicParams.BrutalUp, serverDown))
@@ -420,8 +421,13 @@ func (c *client) udphopDialer(addr *net.UDPAddr) (net.PacketConn, error) {
 	return pktConn, nil
 }
 
+type dialerConf struct {
+	net.Destination
+	*internet.MemoryStreamConfig
+}
+
 type clientManager struct {
-	m     map[string]*client
+	m     map[dialerConf]*client
 	mutex sync.Mutex
 }
 
@@ -434,7 +440,8 @@ func (m *clientManager) clean() {
 	}
 }
 
-var manger *clientManager
+var manager *clientManager
+var initmanager sync.Once
 
 func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.MemoryStreamConfig) (stat.Connection, error) {
 	tlsConfig := tls.ConfigFromStreamSettings(streamSettings)
@@ -443,13 +450,24 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 	}
 
 	requireDatagram := hyCtx.RequireDatagramFromContext(ctx)
-	addr := dest.NetAddr()
 	config := streamSettings.ProtocolSettings.(*Config)
 
-	manger.mutex.Lock()
-	c, ok := manger.m[addr]
+	initmanager.Do(func() {
+		manager = &clientManager{
+			m: make(map[dialerConf]*client),
+		}
+		(&task.Periodic{
+			Interval: 30 * time.Second,
+			Execute: func() error {
+				manager.clean()
+				return nil
+			},
+		}).Start()
+	})
+	manager.mutex.Lock()
+	dest.Network = net.Network_UDP
+	c, ok := manager.m[dialerConf{Destination: dest, MemoryStreamConfig: streamSettings}]
 	if !ok {
-		dest.Network = net.Network_UDP
 		c = &client{
 			ctx:            ctx,
 			dest:           dest,
@@ -459,28 +477,15 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 			udpmaskManager: streamSettings.UdpmaskManager,
 			quicParams:     streamSettings.QuicParams,
 		}
-		manger.m[addr] = c
+		manager.m[dialerConf{Destination: dest, MemoryStreamConfig: streamSettings}] = c
 	}
 	c.setCtx(ctx)
-	manger.mutex.Unlock()
+	manager.mutex.Unlock()
 
 	if requireDatagram {
 		return c.udp()
 	}
 	return c.tcp()
-}
-
-func init() {
-	manger = &clientManager{
-		m: make(map[string]*client),
-	}
-	(&task.Periodic{
-		Interval: 30 * time.Second,
-		Execute: func() error {
-			manger.clean()
-			return nil
-		},
-	}).Start()
 }
 
 func init() {

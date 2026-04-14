@@ -14,6 +14,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/platform/filesystem"
@@ -36,6 +37,7 @@ import (
 	"github.com/xtls/xray-core/transport/internet/finalmask/xicmp"
 	"github.com/xtls/xray-core/transport/internet/httpupgrade"
 	"github.com/xtls/xray-core/transport/internet/hysteria"
+	"github.com/xtls/xray-core/transport/internet/hysteria/congestion/bbr"
 	"github.com/xtls/xray-core/transport/internet/kcp"
 	"github.com/xtls/xray-core/transport/internet/reality"
 	"github.com/xtls/xray-core/transport/internet/splithttp"
@@ -53,62 +55,55 @@ var (
 )
 
 type KCPConfig struct {
-	Mtu             *uint32         `json:"mtu"`
-	Tti             *uint32         `json:"tti"`
-	UpCap           *uint32         `json:"uplinkCapacity"`
-	DownCap         *uint32         `json:"downlinkCapacity"`
-	Congestion      *bool           `json:"congestion"`
-	ReadBufferSize  *uint32         `json:"readBufferSize"`
-	WriteBufferSize *uint32         `json:"writeBufferSize"`
-	HeaderConfig    json.RawMessage `json:"header"`
-	Seed            *string         `json:"seed"`
+	Mtu              *uint32 `json:"mtu"`
+	Tti              *uint32 `json:"tti"`
+	UpCap            *uint32 `json:"uplinkCapacity"`
+	DownCap          *uint32 `json:"downlinkCapacity"`
+	CwndMultiplier   *uint32 `json:"cwndMultiplier"`
+	MaxSendingWindow *uint32 `json:"maxSendingWindow"`
+
+	HeaderConfig json.RawMessage `json:"header"`
+	Seed         *string         `json:"seed"`
 }
 
 // Build implements Buildable.
 func (c *KCPConfig) Build() (proto.Message, error) {
-	config := new(kcp.Config)
-
-	if c.Mtu != nil {
-		mtu := *c.Mtu
-		// if mtu < 576 || mtu > 1460 {
-		// 	return nil, errors.New("invalid mKCP MTU size: ", mtu).AtError()
-		// }
-		config.Mtu = &kcp.MTU{Value: mtu}
-	}
-	if c.Tti != nil {
-		tti := *c.Tti
-		if tti < 10 || tti > 5000 {
-			return nil, errors.New("invalid mKCP TTI: ", tti).AtError()
-		}
-		config.Tti = &kcp.TTI{Value: tti}
-	}
-	if c.UpCap != nil {
-		config.UplinkCapacity = &kcp.UplinkCapacity{Value: *c.UpCap}
-	}
-	if c.DownCap != nil {
-		config.DownlinkCapacity = &kcp.DownlinkCapacity{Value: *c.DownCap}
-	}
-	if c.Congestion != nil {
-		config.Congestion = *c.Congestion
-	}
-	if c.ReadBufferSize != nil {
-		size := *c.ReadBufferSize
-		if size > 0 {
-			config.ReadBuffer = &kcp.ReadBuffer{Size: size * 1024 * 1024}
-		} else {
-			config.ReadBuffer = &kcp.ReadBuffer{Size: 512 * 1024}
-		}
-	}
-	if c.WriteBufferSize != nil {
-		size := *c.WriteBufferSize
-		if size > 0 {
-			config.WriteBuffer = &kcp.WriteBuffer{Size: size * 1024 * 1024}
-		} else {
-			config.WriteBuffer = &kcp.WriteBuffer{Size: 512 * 1024}
-		}
-	}
 	if c.HeaderConfig != nil || c.Seed != nil {
 		return nil, errors.PrintRemovedFeatureError("mkcp header & seed", "finalmask/udp header-* & mkcp-original & mkcp-aes128gcm")
+	}
+
+	config := common.Must2(internet.CreateTransportConfig(kcp.ProtocolName)).(*kcp.Config)
+
+	if c.Mtu != nil {
+		config.Mtu = *c.Mtu
+	}
+	if c.Tti != nil {
+		config.Tti = *c.Tti
+	}
+	if c.UpCap != nil {
+		config.UplinkCapacity = *c.UpCap
+	}
+	if c.DownCap != nil {
+		config.DownlinkCapacity = *c.DownCap
+	}
+	if c.CwndMultiplier != nil {
+		config.CwndMultiplier = *c.CwndMultiplier
+	}
+	if c.MaxSendingWindow != nil {
+		config.MaxSendingWindow = *c.MaxSendingWindow
+	}
+
+	if config.Mtu < 21 {
+		return nil, errors.New("Mtu must be at least 21").AtError()
+	}
+	if config.Tti < 10 || config.Tti > 1000 {
+		return nil, errors.New("invalid mKCP TTI: ", c.Tti).AtError()
+	}
+	if config.CwndMultiplier < 1 {
+		return nil, errors.New("CwndMultiplier must be at least 1").AtError()
+	}
+	if config.GetSendingBufferSize() == 0 {
+		return nil, errors.New("MaxSendingWindow must be >= Mtu").AtError()
 	}
 
 	return config, nil
@@ -630,6 +625,7 @@ func (c *TLSCertConfig) Build() (*tls.Certificate, error) {
 type QuicParamsConfig struct {
 	Congestion                  string    `json:"congestion"`
 	Debug                       bool      `json:"debug"`
+	BbrProfile                  string    `json:"bbrProfile"`
 	BrutalUp                    Bandwidth `json:"brutalUp"`
 	BrutalDown                  Bandwidth `json:"brutalDown"`
 	UdpHop                      UdpHop    `json:"udpHop"`
@@ -1662,16 +1658,30 @@ func (c *Sudoku) Build() (proto.Message, error) {
 }
 
 type Xdns struct {
-	Domain string `json:"domain"`
+	Domain json.RawMessage `json:"domain"`
+
+	Domains   []string `json:"domains"`
+	Resolvers []string `json:"resolvers"`
 }
 
 func (c *Xdns) Build() (proto.Message, error) {
-	if c.Domain == "" {
-		return nil, errors.New("empty domain")
+	if c.Domain != nil {
+		return nil, errors.PrintRemovedFeatureError("domain", "domains(server) & resolvers(client)")
+	}
+
+	if len(c.Domains) == 0 && len(c.Resolvers) == 0 {
+		return nil, errors.New("empty domains & empty resolvers")
+	}
+
+	for _, r := range c.Resolvers {
+		if !strings.Contains(r, "+udp://") {
+			return nil, errors.New("invalid resolver ", r)
+		}
 	}
 
 	return &xdns.Config{
-		Domain: c.Domain,
+		Domains:   c.Domains,
+		Resolvers: c.Resolvers,
 	}, nil
 }
 
@@ -1896,6 +1906,16 @@ func (c *StreamConfig) Build() (*internet.StreamConfig, error) {
 			config.Udpmasks = append(config.Udpmasks, serial.ToTypedMessage(u))
 		}
 		if c.FinalMask.QuicParams != nil {
+			profile := strings.ToLower(c.FinalMask.QuicParams.BbrProfile)
+			switch profile {
+			case "", string(bbr.ProfileConservative), string(bbr.ProfileStandard), string(bbr.ProfileAggressive):
+				if profile == "" {
+					profile = string(bbr.ProfileStandard)
+				}
+			default:
+				return nil, errors.New("unknown bbr profile")
+			}
+
 			up, err := c.FinalMask.QuicParams.BrutalUp.Bps()
 			if err != nil {
 				return nil, err
@@ -1967,6 +1987,7 @@ func (c *StreamConfig) Build() (*internet.StreamConfig, error) {
 
 			config.QuicParams = &internet.QuicParams{
 				Congestion: c.FinalMask.QuicParams.Congestion,
+				BbrProfile: profile,
 				BrutalUp:   up,
 				BrutalDown: down,
 				UdpHop: &internet.UdpHop{
