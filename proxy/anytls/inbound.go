@@ -17,7 +17,9 @@ import (
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/policy"
 	"github.com/xtls/xray-core/features/routing"
+	"github.com/xtls/xray-core/transport/internet/reality"
 	"github.com/xtls/xray-core/transport/internet/stat"
+	"github.com/xtls/xray-core/transport/internet/tls"
 )
 
 type Server struct {
@@ -113,6 +115,13 @@ func (s *Server) Process(ctx context.Context, network xnet.Network, conn stat.Co
 	inb.Name = protocolName
 	inb.User = user
 	inb.CanSpliceCopy = 3
+	switch conn.(type) {
+	case *tls.Conn, *reality.Conn:
+	default:
+		if content := sessionctx.ContentFromContext(ctx); content != nil {
+			content.SetAttribute("anytls", "notls")
+		}
+	}
 
 	return sess.readLoop(ctx)
 }
