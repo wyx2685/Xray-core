@@ -111,6 +111,8 @@
   - [Invisible Man - Xray](https://github.com/InvisibleManVPN/InvisibleMan-XRayClient)
   - [AnyPortal](https://github.com/AnyPortal/AnyPortal)
   - [GenyConnect](https://github.com/genyleap/GenyConnect)
+  - [OneXray](https://github.com/OneXray/OneXray)
+  - [XrayUI-dev](https://github.com/PhoenixNil/XrayUI-dev)
 - Android
   - [v2rayNG](https://github.com/2dust/v2rayNG)
   - [X-flutter](https://github.com/XTLS/X-flutter)
@@ -119,6 +121,7 @@
   - [XrayFA](https://github.com/Q7DF1/XrayFA)
   - [AnyPortal](https://github.com/AnyPortal/AnyPortal)
   - [NetProxy-Magisk](https://github.com/Fanju6/NetProxy-Magisk)
+  - [OneXray](https://github.com/OneXray/OneXray)
 - iOS & macOS arm64 & tvOS
   - [Happ](https://apps.apple.com/app/happ-proxy-utility/id6504287215) | [Happ RU](https://apps.apple.com/ru/app/happ-proxy-utility-plus/id6746188973) | [Happ tvOS](https://apps.apple.com/us/app/happ-proxy-utility-for-tv/id6748297274)
   - [Streisand](https://apps.apple.com/app/streisand/id6450534064)
@@ -143,10 +146,12 @@
   - [AnyPortal](https://github.com/AnyPortal/AnyPortal)
   - [v2rayN](https://github.com/2dust/v2rayN)
   - [GenyConnect](https://github.com/genyleap/GenyConnect)
+  - [OneXray](https://github.com/OneXray/OneXray)
 
 ## Others that support VLESS, XTLS, REALITY, XUDP, PLUX...
 
 - iOS & macOS arm64 & tvOS
+  - [Anywhere](https://github.com/NodePassProject/Anywhere)
   - [Shadowrocket](https://apps.apple.com/app/shadowrocket/id932747118)
   - [Loon](https://apps.apple.com/us/app/loon/id1373567447)
   - [Egern](https://apps.apple.com/us/app/egern/id1616105820)

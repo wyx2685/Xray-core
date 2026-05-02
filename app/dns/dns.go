@@ -158,9 +158,12 @@ func New(ctx context.Context, config *Config) (*DNS, error) {
 		clients = append(clients, client)
 	}
 
-	domainMatcher, err := geodata.DomainReg.BuildDomainMatcher(effectiveRules)
-	if err != nil {
-		return nil, err
+	var domainMatcher geodata.DomainMatcher
+	if len(effectiveRules) > 0 {
+		domainMatcher, err = geodata.DomainReg.BuildDomainMatcher(effectiveRules)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	// If there is no DNS client in config, add a `localhost` DNS client
@@ -271,24 +274,27 @@ func (s *DNS) sortClients(domain string) []*Client {
 
 	// Priority domain matching
 	hasMatch := false
-	MatchSlice := s.domainMatcher.Match(strings.ToLower(domain))
-	sort.Slice(MatchSlice, func(i, j int) bool {
-		return MatchSlice[i] < MatchSlice[j]
-	})
-	for _, match := range MatchSlice {
-		info := s.matcherInfos[match]
-		client := s.clients[info.clientIdx]
-		domainRule := info.domainRule
-		domainRules = append(domainRules, fmt.Sprintf("%s(DNS idx:%d)", domainRule, info.clientIdx))
-		if clientUsed[info.clientIdx] {
-			continue
-		}
-		clientUsed[info.clientIdx] = true
-		clients = append(clients, client)
-		clientNames = append(clientNames, client.Name())
-		hasMatch = true
-		if client.finalQuery {
-			return clients
+	if s.domainMatcher != nil {
+		matchSlice := s.domainMatcher.Match(strings.ToLower(domain))
+		sort.Slice(matchSlice, func(i, j int) bool {
+			return matchSlice[i] < matchSlice[j]
+		})
+		for _, match := range matchSlice {
+			info := s.matcherInfos[match]
+			client := s.clients[info.clientIdx]
+			domainRule := info.domainRule
+			domainRules = append(domainRules, fmt.Sprintf("%s(DNS idx:%d)", domainRule, info.clientIdx))
+			if clientUsed[info.clientIdx] {
+				continue
+			}
+			clientUsed[info.clientIdx] = true
+			clients = append(clients, client)
+			clientNames = append(clientNames, client.Name())
+			hasMatch = true
+			if client.finalQuery {
+				logDecision(s.ctx, domain, domainRules, clientNames)
+				return clients
+			}
 		}
 	}
 
@@ -302,17 +308,13 @@ func (s *DNS) sortClients(domain string) []*Client {
 			clients = append(clients, client)
 			clientNames = append(clientNames, client.Name())
 			if client.finalQuery {
+				logDecision(s.ctx, domain, domainRules, clientNames)
 				return clients
 			}
 		}
 	}
 
-	if len(domainRules) > 0 {
-		errors.LogDebug(s.ctx, "domain ", domain, " matches following rules: ", domainRules)
-	}
-	if len(clientNames) > 0 {
-		errors.LogDebug(s.ctx, "domain ", domain, " will use DNS in order: ", clientNames)
-	}
+	logDecision(s.ctx, domain, domainRules, clientNames)
 
 	if len(clients) == 0 {
 		if len(s.clients) > 0 {
@@ -325,6 +327,15 @@ func (s *DNS) sortClients(domain string) []*Client {
 	}
 
 	return clients
+}
+
+func logDecision(ctx context.Context, domain string, domainRules []string, clientNames []string) {
+	if len(domainRules) > 0 {
+		errors.LogDebug(ctx, "domain ", domain, " matches following rules: ", domainRules)
+	}
+	if len(clientNames) > 0 {
+		errors.LogDebug(ctx, "domain ", domain, " will use DNS in order: ", clientNames)
+	}
 }
 
 func mergeQueryErrors(domain string, errs []error) error {

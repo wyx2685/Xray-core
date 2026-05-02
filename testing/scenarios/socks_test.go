@@ -50,7 +50,9 @@ func TestSocksBridgeTCP(t *testing.T) {
 		},
 		Outbound: []*core.OutboundHandlerConfig{
 			{
-				ProxySettings: serial.ToTypedMessage(&freedom.Config{}),
+				ProxySettings: serial.ToTypedMessage(&freedom.Config{
+					FinalRules: []*freedom.FinalRuleConfig{{Action: freedom.RuleAction_Allow}},
+				}),
 			},
 		},
 	}
@@ -76,7 +78,7 @@ func TestSocksBridgeTCP(t *testing.T) {
 					Server: &protocol.ServerEndpoint{
 						Address: net.NewIPOrDomain(net.LocalHostIP),
 						Port:    uint32(serverPort),
-						User:    &protocol.User{
+						User: &protocol.User{
 							Account: serial.ToTypedMessage(&socks.Account{
 								Username: "Test Account",
 								Password: "Test Password",
@@ -125,7 +127,9 @@ func TestSocksWithHttpRequest(t *testing.T) {
 		},
 		Outbound: []*core.OutboundHandlerConfig{
 			{
-				ProxySettings: serial.ToTypedMessage(&freedom.Config{}),
+				ProxySettings: serial.ToTypedMessage(&freedom.Config{
+					FinalRules: []*freedom.FinalRuleConfig{{Action: freedom.RuleAction_Allow}},
+				}),
 			},
 		},
 	}
@@ -151,7 +155,7 @@ func TestSocksWithHttpRequest(t *testing.T) {
 					Server: &protocol.ServerEndpoint{
 						Address: net.NewIPOrDomain(net.LocalHostIP),
 						Port:    uint32(serverPort),
-						User:    &protocol.User{
+						User: &protocol.User{
 							Account: serial.ToTypedMessage(&http.Account{
 								Username: "Test Account",
 								Password: "Test Password",
@@ -213,7 +217,7 @@ func TestSocksBridageUDP(t *testing.T) {
 			},
 			Outbound: []*core.OutboundHandlerConfig{
 				{
-					ProxySettings: serial.ToTypedMessage(&freedom.Config{}),
+					ProxySettings: serial.ToTypedMessage(&freedom.Config{FinalRules: []*freedom.FinalRuleConfig{{Action: freedom.RuleAction_Allow}}}),
 				},
 			},
 		}
@@ -251,7 +255,7 @@ func TestSocksBridageUDP(t *testing.T) {
 					Server: &protocol.ServerEndpoint{
 						Address: net.NewIPOrDomain(net.LocalHostIP),
 						Port:    uint32(serverPort),
-						User:    &protocol.User{
+						User: &protocol.User{
 							Account: serial.ToTypedMessage(&socks.Account{
 								Username: "Test Account",
 								Password: "Test Password",
@@ -328,7 +332,7 @@ func TestSocksBridageUDPWithRouting(t *testing.T) {
 				},
 				{
 					Tag:           "out",
-					ProxySettings: serial.ToTypedMessage(&freedom.Config{}),
+					ProxySettings: serial.ToTypedMessage(&freedom.Config{FinalRules: []*freedom.FinalRuleConfig{{Action: freedom.RuleAction_Allow}}}),
 				},
 			},
 		}
@@ -424,7 +428,9 @@ func TestSocksConformanceMod(t *testing.T) {
 		},
 		Outbound: []*core.OutboundHandlerConfig{
 			{
-				ProxySettings: serial.ToTypedMessage(&freedom.Config{}),
+				ProxySettings: serial.ToTypedMessage(&freedom.Config{
+					FinalRules: []*freedom.FinalRuleConfig{{Action: freedom.RuleAction_Allow}},
+				}),
 			},
 		},
 	}
