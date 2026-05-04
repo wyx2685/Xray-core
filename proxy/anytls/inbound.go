@@ -118,9 +118,7 @@ func (s *Server) Process(ctx context.Context, network xnet.Network, conn stat.Co
 	switch conn.(type) {
 	case *tls.Conn, *reality.Conn:
 	default:
-		if content := sessionctx.ContentFromContext(ctx); content != nil {
-			content.SetAttribute("anytls", "notls")
-		}
+		sess.noTLS = true
 	}
 
 	return sess.readLoop(ctx)

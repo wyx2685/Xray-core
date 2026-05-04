@@ -17,6 +17,7 @@ import (
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/net"
+	sessionctx "github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/common/singbridge"
 	"github.com/xtls/xray-core/features/routing"
 	"github.com/xtls/xray-core/transport"
@@ -44,6 +45,7 @@ type session struct {
 	dispatcher       routing.Dispatcher
 	handshakeDone    bool
 	clientPaddingMD5 string
+	noTLS            bool
 
 	client       *Client
 	nextSID      atomic.Uint32
@@ -60,6 +62,20 @@ type session struct {
 	idleSinceNano atomic.Int64
 	inIdlePool    atomic.Bool
 	dieHook       func()
+}
+
+func (s *session) dispatchContext(ctx context.Context, st *stream) context.Context {
+	if st.dispatchCtx != nil {
+		return st.dispatchCtx
+	}
+	dispatchCtx := sessionctx.SubContextFromMuxInbound(ctx)
+	if s.noTLS {
+		if content := sessionctx.ContentFromContext(dispatchCtx); content != nil {
+			content.SetAttribute("anytls", "notls")
+		}
+	}
+	st.dispatchCtx = dispatchCtx
+	return dispatchCtx
 }
 
 func (s *session) handleNewStream(ctx context.Context, st *stream, body buf.MultiBuffer) error {
@@ -86,6 +102,8 @@ func (s *session) handleNewStream(ctx context.Context, st *stream, body buf.Mult
 		return errors.New("anytls: invalid destination address in SYN")
 	}
 
+	dispatchCtx := s.dispatchContext(ctx, st)
+
 	// Check for UDP-over-TCP v2 magic domain in a new stream request.
 	if strings.Contains(dest.Address.String(), "udp-over-tcp.arpa") {
 		st.isUDP = true
@@ -94,12 +112,12 @@ func (s *session) handleNewStream(ctx context.Context, st *stream, body buf.Mult
 			return err
 		}
 		if !body.IsEmpty() {
-			return s.handleFirstUDPFrame(ctx, st, body)
+			return s.handleFirstUDPFrame(dispatchCtx, st, body)
 		}
 		return nil
 	}
 
-	l, err := s.dispatcher.Dispatch(ctx, dest)
+	l, err := s.dispatcher.Dispatch(dispatchCtx, dest)
 	if err != nil {
 		errors.LogWarning(ctx, "anytls: new stream dispatcher error, streamId=", st.sid, " err=", err)
 		return nil
@@ -147,7 +165,7 @@ func (s *session) handleFirstUDPFrame(ctx context.Context, st *stream, body buf.
 		}
 		requestDest := singbridge.ToDestination(request.Destination, net.Network_UDP)
 
-		link, err := s.dispatcher.Dispatch(ctx, requestDest)
+		link, err := s.dispatcher.Dispatch(s.dispatchContext(ctx, st), requestDest)
 		if err != nil {
 			errors.LogWarning(ctx, "anytls: UDP dispatcher error, streamId=", st.sid, " err=", err)
 			_ = s.sendFrame(newFrame(cmdFIN, st.sid))

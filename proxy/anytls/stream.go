@@ -1,6 +1,7 @@
 package anytls
 
 import (
+	"context"
 	"sync"
 
 	"github.com/xtls/xray-core/common"
@@ -18,8 +19,9 @@ type stream struct {
 	err      error
 	dieHook  func()
 
-	isUDP     bool
-	udpTarget *xnet.Destination
+	dispatchCtx context.Context
+	isUDP       bool
+	udpTarget   *xnet.Destination
 }
 
 func newStream(sid uint32, link *transport.Link) *stream {
