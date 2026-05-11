@@ -89,10 +89,11 @@ func init() {
 }
 
 type FinalRule struct {
-	action  RuleAction
-	network [8]bool
-	port    net.MemoryPortList
-	ip      geodata.IPMatcher
+	action     RuleAction
+	network    [8]bool
+	port       net.MemoryPortList
+	ip         geodata.IPMatcher
+	blockDelay *Range
 }
 
 // Handler handles Freedom connections.
@@ -104,7 +105,8 @@ type Handler struct {
 
 func buildFinalRule(config *FinalRuleConfig) (*FinalRule, error) {
 	rule := &FinalRule{
-		action: config.GetAction(),
+		action:     config.GetAction(),
+		blockDelay: config.GetBlockDelay(),
 	}
 
 	if len(config.Networks) == 0 {
@@ -176,7 +178,7 @@ func getDefaultFinalRule(inbound *session.Inbound) *FinalRule {
 }
 
 func (h *Handler) shouldResolveDomainBeforeFinalRules(dialDest net.Destination, defaultRule *FinalRule) bool {
-	if dialDest.Network != net.Network_TCP || !dialDest.Address.Family().IsDomain() {
+	if !dialDest.Address.Family().IsDomain() {
 		return false
 	}
 	if len(h.finalRules) > 0 {
@@ -191,14 +193,21 @@ func (h *Handler) shouldResolveDomainBeforeFinalRules(dialDest net.Destination, 
 	return false
 }
 
-func (h *Handler) applyFinalRules(network net.Network, address net.Address, port net.Port, defaultRule *FinalRule) RuleAction {
+func (h *Handler) matchFinalRule(network net.Network, address net.Address, port net.Port, defaultRule *FinalRule) *FinalRule {
 	for _, rule := range h.finalRules {
 		if rule.Apply(network, address, port) {
-			return rule.action
+			return rule
 		}
 	}
 	if defaultRule != nil && defaultRule.Apply(network, address, port) {
-		return defaultRule.action
+		return defaultRule
+	}
+	return nil
+}
+
+func (h *Handler) applyFinalRules(network net.Network, address net.Address, port net.Port, defaultRule *FinalRule) RuleAction {
+	if rule := h.matchFinalRule(network, address, port, defaultRule); rule != nil {
+		return rule.action
 	}
 	return RuleAction_Allow
 }
@@ -221,6 +230,20 @@ func (h *Handler) Init(config *Config, pm policy.Manager) error {
 func (h *Handler) policy() policy.Session {
 	p := h.policyManager.ForLevel(h.config.UserLevel)
 	return p
+}
+
+func (h *Handler) blockDelay(rule *FinalRule) time.Duration {
+	min := uint64(30)
+	max := uint64(90)
+	if rule.blockDelay != nil {
+		min = rule.blockDelay.Min
+		max = rule.blockDelay.Max
+	}
+	span := max - min
+	if max < min {
+		span = min - max
+	}
+	return time.Duration(min+uint64(dice.Roll(int(span+1)))) * time.Second
 }
 
 func isValidAddress(addr *net.IPOrDomain) bool {
@@ -269,6 +292,8 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 
 	var conn stat.Connection
 	var blockedDest *net.Destination
+	var blockedRule *FinalRule
+	firstResolve := true
 	err := retry.ExponentialBackoff(5, 100).On(func() error {
 		dialDest := destination
 		if h.config.DomainStrategy.HasStrategy() && dialDest.Address.Family().IsDomain() {
@@ -279,7 +304,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 			ips, err := internet.LookupForIP(dialDest.Address.Domain(), strategy, outGateway)
 			if err != nil {
 				errors.LogInfoInner(ctx, err, "failed to get IP address for domain ", dialDest.Address.Domain())
-				if h.config.DomainStrategy.ForceIP() {
+				if h.config.DomainStrategy.ForceIP() || h.shouldResolveDomainBeforeFinalRules(dialDest, defaultRule) {
 					return err
 				}
 			} else {
@@ -290,19 +315,35 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 				}
 				errors.LogInfo(ctx, "dialing to ", dialDest)
 			}
-		} else if h.shouldResolveDomainBeforeFinalRules(dialDest, defaultRule) {
-			addrs, err := net.DefaultResolver.LookupIPAddr(ctx, dialDest.Address.Domain())
-			if err != nil {
-				errors.LogInfoInner(ctx, err, "failed to get IP address for domain ", dialDest.Address.Domain())
-			} else if len(addrs) > 0 {
-				if addr := net.IPAddress(addrs[dice.Roll(len(addrs))].IP); addr != nil {
-					dialDest.Address = addr
-					errors.LogInfo(ctx, "dialing to ", dialDest)
+		} else if h.shouldResolveDomainBeforeFinalRules(dialDest, defaultRule) { // asis + domain + hasrules
+			domain := dialDest.Address.Domain()
+			var ips []net.IP
+			if firstResolve {
+				firstResolve = false
+				supportIPv4, supportIPv6 := utils.CheckRoutes()
+				if supportIPv4 {
+					ips, _ = net.DefaultResolver.LookupIP(ctx, "ip4", domain)
 				}
+				if len(ips) == 0 && supportIPv6 {
+					ips, _ = net.DefaultResolver.LookupIP(ctx, "ip6", domain)
+				}
+				if len(ips) == 0 {
+					return errors.New("failed to get IP address for domain ", domain)
+				}
+			} else {
+				ips, _ = net.DefaultResolver.LookupIP(ctx, "ip", domain)
+			}
+			if len(ips) == 0 { // SRV/TXT, lookup failed
+				return errors.New("failed to get IP address for domain ", domain)
+			}
+			if addr := net.IPAddress(ips[dice.Roll(len(ips))]); addr != nil {
+				dialDest.Address = addr
+				errors.LogInfo(ctx, "dialing to ", dialDest)
 			}
 		}
-		if dialDest.Network == net.Network_TCP && h.applyFinalRules(dialDest.Network, dialDest.Address, dialDest.Port, defaultRule) == RuleAction_Block {
+		if rule := h.matchFinalRule(dialDest.Network, dialDest.Address, dialDest.Port, defaultRule); rule != nil && rule.action == RuleAction_Block {
 			blockedDest = &dialDest
+			blockedRule = rule
 			return nil
 		}
 
@@ -318,12 +359,20 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 		return errors.New("failed to open connection to ", destination).Base(err)
 	}
 	if blockedDest != nil {
-		return errors.New("blocked target: ", *blockedDest).AtInfo()
+		delay := h.blockDelay(blockedRule)
+		errors.LogInfo(ctx, "blocked target: ", *blockedDest, ", blackholing connection for ", delay)
+		timer := time.AfterFunc(delay, func() {
+			common.Interrupt(input)
+			common.Interrupt(output)
+			errors.LogInfo(ctx, "closed blackholed connection to blocked target: ", *blockedDest)
+		})
+		defer timer.Stop()
+		defer common.Close(output)
+		if err := buf.Copy(input, buf.Discard); err != nil {
+			return nil
+		}
+		return nil
 	}
-	// if remoteDest := net.DestinationFromAddr(conn.RemoteAddr()); h.applyFinalRules(remoteDest.Network, remoteDest.Address, remoteDest.Port, defaultRule) == RuleAction_Block {
-	// 	conn.Close()
-	// 	return errors.New("blocked target: ", remoteDest).AtInfo()
-	// }
 	if h.config.ProxyProtocol > 0 && h.config.ProxyProtocol <= 2 {
 		version := byte(h.config.ProxyProtocol)
 		srcAddr := inbound.Source.RawNetAddr()

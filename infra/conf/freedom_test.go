@@ -45,7 +45,8 @@ func TestFreedomConfig(t *testing.T) {
 					"action": "block",
 					"network": "tcp,udp",
 					"port": "53,443",
-					"ip": ["10.0.0.0/8", "2001:db8::/32"]
+					"ip": ["10.0.0.0/8", "2001:db8::/32"],
+					"blockDelay": "30-60"
 				}, {
 					"action": "allow",
 					"network": ["udp"]
@@ -84,6 +85,10 @@ func TestFreedomConfig(t *testing.T) {
 									},
 								},
 							},
+						},
+						BlockDelay: &freedom.Range{
+							Min: 30,
+							Max: 60,
 						},
 					},
 					{

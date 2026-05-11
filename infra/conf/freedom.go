@@ -44,10 +44,11 @@ type Noise struct {
 }
 
 type FreedomFinalRuleConfig struct {
-	Action  string       `json:"action"`
-	Network *NetworkList `json:"network"`
-	Port    *PortList    `json:"port"`
-	IP      *StringList  `json:"ip"`
+	Action     string       `json:"action"`
+	Network    *NetworkList `json:"network"`
+	Port       *PortList    `json:"port"`
+	IP         *StringList  `json:"ip"`
+	BlockDelay *Int32Range  `json:"blockDelay"`
 }
 
 // Build implements Buildable
@@ -274,6 +275,13 @@ func (c *FreedomFinalRuleConfig) Build() (*freedom.FinalRuleConfig, error) {
 			return nil, err
 		}
 		rule.Ip = rules
+	}
+
+	if c.BlockDelay != nil {
+		rule.BlockDelay = &freedom.Range{
+			Min: uint64(c.BlockDelay.From),
+			Max: uint64(c.BlockDelay.To),
+		}
 	}
 
 	return rule, nil

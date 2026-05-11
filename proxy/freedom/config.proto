@@ -36,6 +36,11 @@ message Noise {
   string apply_to = 6;
 }
 
+message Range {
+  uint64 min = 1;
+  uint64 max = 2;
+}
+
 enum RuleAction {
   Allow = 0;
   Block = 1;
@@ -46,6 +51,7 @@ message FinalRuleConfig {
   repeated xray.common.net.Network networks = 2;
   xray.common.net.PortList port_list = 3;
   repeated xray.common.geodata.IPRule ip = 4;
+  Range block_delay = 5;
 }
 
 message Config {

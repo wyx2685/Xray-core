@@ -3,6 +3,7 @@ package hysteria
 import (
 	"context"
 	go_tls "crypto/tls"
+	"math/rand"
 	"net/http"
 	"net/url"
 	"reflect"
@@ -64,7 +65,7 @@ func (c *client) close() {
 	c.udpSM = nil
 }
 
-func (c *client) dial() error {
+func (c *client) dial(ctx context.Context) error {
 	status := c.status()
 	if status == StatusActive {
 		return nil
@@ -113,30 +114,54 @@ func (c *client) dial() error {
 	// 	quicConfig.KeepAlivePeriod = 10 * time.Second
 	// }
 
+	udpHopDialer := func(addr *net.UDPAddr) (net.PacketConn, error) {
+		conn, err := internet.DialSystem(ctx, net.UDPDestination(net.IPAddress(addr.IP), net.Port(addr.Port)), c.socketConfig)
+		if err != nil {
+			errors.LogInfoInner(context.Background(), err, "skip hop: failed to dial to dest")
+			return nil, errors.New("")
+		}
+
+		var pktConn net.PacketConn
+
+		switch c := conn.(type) {
+		case *internet.PacketConnWrapper:
+			pktConn = c.PacketConn
+		default:
+			panic(reflect.TypeOf(c))
+		}
+
+		return pktConn, nil
+	}
+
 	var pktConn net.PacketConn
 	var udpAddr *net.UDPAddr
-	var err error
-	udpAddr, err = net.ResolveUDPAddr("udp", c.dest.NetAddr())
-	if err != nil {
-		return err
-	}
 	if len(quicParams.UdpHop.Ports) > 0 {
-		pktConn, err = udphop.NewUDPHopPacketConn(udphop.ToAddrs(udpAddr.IP, quicParams.UdpHop.Ports), time.Duration(quicParams.UdpHop.IntervalMin)*time.Second, time.Duration(quicParams.UdpHop.IntervalMax)*time.Second, c.udpHopDialer)
+		index := rand.Intn(len(quicParams.UdpHop.Ports))
+		c.dest.Port = net.Port(quicParams.UdpHop.Ports[index])
+		conn, err := internet.DialSystem(ctx, c.dest, c.socketConfig)
 		if err != nil {
-			return err
-		}
-	} else {
-		conn, err := internet.DialSystem(context.Background(), c.dest, c.socketConfig)
-		if err != nil {
-			return err
+			return errors.New("failed to dial to dest").Base(err)
 		}
 		switch c := conn.(type) {
 		case *internet.PacketConnWrapper:
 			pktConn = c.PacketConn
-		case *net.UDPConn:
-			pktConn = c
+			udpAddr = conn.RemoteAddr().(*net.UDPAddr)
+		default:
+			panic(reflect.TypeOf(c))
+		}
+		pktConn = udphop.NewUDPHopPacketConn(udphop.ToAddrs(udpAddr.IP, quicParams.UdpHop.Ports), time.Duration(quicParams.UdpHop.IntervalMin)*time.Second, time.Duration(quicParams.UdpHop.IntervalMax)*time.Second, udpHopDialer, pktConn, index)
+	} else {
+		conn, err := internet.DialSystem(ctx, c.dest, c.socketConfig)
+		if err != nil {
+			return errors.New("failed to dial to dest").Base(err)
+		}
+		switch c := conn.(type) {
+		case *internet.PacketConnWrapper:
+			pktConn = c.PacketConn
+			udpAddr = c.RemoteAddr().(*net.UDPAddr)
 		case *cnc.Connection:
 			pktConn = &internet.FakePacketConn{Conn: c}
+			udpAddr = &net.UDPAddr{IP: c.RemoteAddr().(*net.TCPAddr).IP, Port: c.RemoteAddr().(*net.TCPAddr).Port}
 		default:
 			panic(reflect.TypeOf(c))
 		}
@@ -228,11 +253,11 @@ func (c *client) dial() error {
 	return nil
 }
 
-func (c *client) tcp() (stat.Connection, error) {
+func (c *client) tcp(ctx context.Context) (stat.Connection, error) {
 	c.Lock()
 	defer c.Unlock()
 
-	err := c.dial()
+	err := c.dial(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -251,11 +276,11 @@ func (c *client) tcp() (stat.Connection, error) {
 	}, nil
 }
 
-func (c *client) udp() (stat.Connection, error) {
+func (c *client) udp(ctx context.Context) (stat.Connection, error) {
 	c.Lock()
 	defer c.Unlock()
 
-	err := c.dial()
+	err := c.dial(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -269,29 +294,6 @@ func (c *client) clean() {
 		c.close()
 	}
 	c.Unlock()
-}
-
-func (c *client) udpHopDialer(addr *net.UDPAddr) (net.PacketConn, error) {
-	conn, err := internet.DialSystem(context.Background(), net.UDPDestination(net.IPAddress(addr.IP), net.Port(addr.Port)), c.socketConfig)
-	if err != nil {
-		errors.LogInfoInner(context.Background(), err, "skip hop: failed to dial to dest")
-		return nil, errors.New("failed to dial to dest").Base(err)
-	}
-
-	var pktConn net.PacketConn
-
-	switch c := conn.(type) {
-	case *internet.PacketConnWrapper:
-		pktConn = c.PacketConn
-	case *net.UDPConn:
-		pktConn = c
-	default:
-		errors.LogInfo(context.Background(), "skip hop: invalid conn ", reflect.TypeOf(c))
-		conn.Close()
-		return nil, errors.New("invalid conn ", reflect.TypeOf(c))
-	}
-
-	return pktConn, nil
 }
 
 type dialerConf struct {
@@ -356,9 +358,9 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 	}
 
 	if datagram {
-		return c.udp()
+		return c.udp(ctx)
 	}
-	return c.tcp()
+	return c.tcp(ctx)
 }
 
 func init() {
