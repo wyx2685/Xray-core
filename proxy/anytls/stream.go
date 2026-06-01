@@ -5,6 +5,7 @@ import (
 	"sync"
 
 	"github.com/xtls/xray-core/common"
+	"github.com/xtls/xray-core/common/buf"
 	xnet "github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/transport"
 )
@@ -23,6 +24,9 @@ type stream struct {
 	isUDP        bool
 	udpTarget    *xnet.Destination
 	udpIsConnect bool
+	udpCh        chan *buf.Buffer
+	udpDone      chan struct{}
+	udpDoneOnce  sync.Once
 }
 
 func newStream(sid uint32, link *transport.Link) *stream {
@@ -35,6 +39,9 @@ func newStream(sid uint32, link *transport.Link) *stream {
 
 func (st *stream) close(err error) {
 	if st.done == nil {
+		if st.udpDone != nil {
+			st.udpDoneOnce.Do(func() { close(st.udpDone) })
+		}
 		if st.link != nil {
 			common.Close(st.link.Reader)
 			common.Close(st.link.Writer)
@@ -45,6 +52,9 @@ func (st *stream) close(err error) {
 		st.errMu.Lock()
 		st.err = err
 		st.errMu.Unlock()
+		if st.udpDone != nil {
+			st.udpDoneOnce.Do(func() { close(st.udpDone) })
+		}
 		if st.link != nil {
 			common.Close(st.link.Reader)
 			common.Close(st.link.Writer)
