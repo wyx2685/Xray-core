@@ -144,17 +144,8 @@ func (s *session) handleNewStream(ctx context.Context, st *stream, body buf.Mult
 
 func (s *session) handleFirstUDPFrame(ctx context.Context, st *stream, body buf.MultiBuffer) error {
 	if st.link == nil {
-		var first *buf.Buffer
-		body, first = buf.SplitFirst(body)
-		if first == nil {
-			errors.LogWarning(ctx, "anytls: UDP missing request data")
-			_ = s.sendFrame(newFrame(cmdFIN, st.sid))
-			s.finishStream(st.sid, nil)
-			return nil
-		}
-		request, err := uot.ReadRequest(first)
+		request, body, err := readUoTRequest(body)
 		if err != nil {
-			first.Release()
 			errors.LogWarning(ctx, "anytls: UDP failed to parse request:", err)
 			_ = s.sendFrame(newFrame(cmdFIN, st.sid))
 			s.finishStream(st.sid, nil)
@@ -163,7 +154,7 @@ func (s *session) handleFirstUDPFrame(ctx context.Context, st *stream, body buf.
 		st.udpIsConnect = request.IsConnect
 		requestDest, err := singbridge.ToDestination(request.Destination, net.Network_UDP)
 		if err != nil {
-			first.Release()
+			buf.ReleaseMulti(body)
 			errors.LogWarning(ctx, "anytls: UDP invalid destination, streamId=", st.sid, " err=", err)
 			_ = s.sendFrame(newFrame(cmdFIN, st.sid))
 			s.finishStream(st.sid, nil)
@@ -171,6 +162,7 @@ func (s *session) handleFirstUDPFrame(ctx context.Context, st *stream, body buf.
 		}
 		link, err := s.dispatcher.Dispatch(s.dispatchContext(ctx, st), requestDest)
 		if err != nil {
+			buf.ReleaseMulti(body)
 			errors.LogWarning(ctx, "anytls: UDP dispatcher error, streamId=", st.sid, " err=", err)
 			_ = s.sendFrame(newFrame(cmdFIN, st.sid))
 			s.finishStream(st.sid, nil)
@@ -180,57 +172,8 @@ func (s *session) handleFirstUDPFrame(ctx context.Context, st *stream, body buf.
 		st.link = link
 		st.udpTarget = &requestDest
 
-		if !first.IsEmpty() {
-			if request.IsConnect {
-				var length uint16
-				if err := binary.Read(first, binary.BigEndian, &length); err != nil {
-					first.Release()
-					errors.LogWarning(ctx, "anytls: UDP packet too short")
-					_ = s.sendFrame(newFrame(cmdFIN, st.sid))
-					s.finishStream(st.sid, nil)
-					return nil
-				}
-			} else {
-				dest, err := uot.AddrParser.ReadAddrPort(first)
-				if err != nil {
-					first.Release()
-					errors.LogWarning(ctx, "anytls: UDP packet missing destination address")
-					_ = s.sendFrame(newFrame(cmdFIN, st.sid))
-					s.finishStream(st.sid, nil)
-					return nil
-				}
-				requestDest, err := singbridge.ToDestination(dest, net.Network_UDP)
-				if err != nil {
-					first.Release()
-					errors.LogWarning(ctx, "anytls: UDP packet has invalid destination address")
-					_ = s.sendFrame(newFrame(cmdFIN, st.sid))
-					s.finishStream(st.sid, nil)
-					return nil
-				}
-				if requestDest.String() != st.udpTarget.String() {
-					first.Release()
-					errors.LogWarning(ctx, "anytls: UDP packet destination does not match the first packet")
-					_ = s.sendFrame(newFrame(cmdFIN, st.sid))
-					s.finishStream(st.sid, nil)
-					return nil
-				}
-				var length uint16
-				if err := binary.Read(first, binary.BigEndian, &length); err != nil {
-					first.Release()
-					errors.LogWarning(ctx, "anytls: UDP packet too short")
-					_ = s.sendFrame(newFrame(cmdFIN, st.sid))
-					s.finishStream(st.sid, nil)
-					return nil
-				}
-			}
-			body = append(buf.MultiBuffer{first}, body...)
-			first = nil
-		} else {
-			first.Release()
-		}
-
 		if !body.IsEmpty() {
-			if err := st.link.Writer.WriteMultiBuffer(body); err != nil {
+			if err := s.writeUoTFrameToLink(ctx, st, body, request.Destination); err != nil {
 				return err
 			}
 		}
@@ -239,90 +182,85 @@ func (s *session) handleFirstUDPFrame(ctx context.Context, st *stream, body buf.
 		return nil
 	}
 
-	if err := st.link.Writer.WriteMultiBuffer(body); err != nil {
-		return err
+	fallback := M.Socksaddr{}
+	if st.udpTarget != nil {
+		fallback = singbridge.ToSocksaddr(*st.udpTarget)
 	}
-	return nil
+	return s.writeUoTFrameToLink(ctx, st, body, fallback)
 }
 
 func (s *session) handleUDPFrame(ctx context.Context, st *stream, body buf.MultiBuffer) error {
 	if st.link == nil {
 		errors.LogWarning(ctx, "anytls: UDP stream without link, streamId=", st.sid)
+		buf.ReleaseMulti(body)
 		return errors.New("anytls: UDP stream without link")
 	}
-	var first *buf.Buffer
-	body, first = buf.SplitFirst(body)
-	if first == nil {
-		return errors.New("anytls: missing destination address in PSH")
+	fallback := M.Socksaddr{}
+	if st.udpTarget != nil {
+		fallback = singbridge.ToSocksaddr(*st.udpTarget)
 	}
-	if st.udpIsConnect {
-		var length uint16
-		if err := binary.Read(first, binary.BigEndian, &length); err != nil {
-			first.Release()
-			return errors.New("anytls: UDP packet too short")
-		}
-		if first.IsEmpty() {
-			first.Release()
-			first = nil
-		}
-		if first != nil {
-			body = append(buf.MultiBuffer{first}, body...)
-		}
-		if err := st.link.Writer.WriteMultiBuffer(body); err != nil {
-			return err
-		}
-	} else {
-		dest, err := uot.AddrParser.ReadAddrPort(first)
-		if err != nil {
-			first.Release()
-			errors.LogWarning(ctx, "anytls: UDP packet missing destination address")
-			_ = s.sendFrame(newFrame(cmdFIN, st.sid))
-			s.finishStream(st.sid, nil)
-			return nil
-		}
-		requestDest, err := singbridge.ToDestination(dest, net.Network_UDP)
-		if err != nil {
-			first.Release()
-			errors.LogWarning(ctx, "anytls: UDP failed to parse request:", err)
-			_ = s.sendFrame(newFrame(cmdFIN, st.sid))
-			s.finishStream(st.sid, nil)
-			return nil
-		}
+	return s.writeUoTFrameToLink(ctx, st, body, fallback)
+}
 
-		if st.udpTarget == nil || st.udpTarget.String() != requestDest.String() {
-			oldLink := st.link
-			link, err := s.dispatcher.Dispatch(s.dispatchContext(ctx, st), requestDest)
-			if err != nil {
-				errors.LogWarning(ctx, "anytls: UDP dispatcher error, streamId=", st.sid, " err=", err)
-				_ = s.sendFrame(newFrame(cmdFIN, st.sid))
-				s.finishStream(st.sid, nil)
-				return nil
-			}
+func readUoTRequest(body buf.MultiBuffer) (*uot.Request, buf.MultiBuffer, error) {
+	if body.IsEmpty() {
+		return nil, nil, errors.New("anytls: UDP missing request data")
+	}
+	reader := &buf.MultiBufferContainer{MultiBuffer: body}
+	request, err := uot.ReadRequest(reader)
+	if err != nil {
+		_ = reader.Close()
+		return nil, nil, err
+	}
+	return request, reader.MultiBuffer, nil
+}
 
-			st.link = link
-			st.udpTarget = &requestDest
-			if oldLink != nil {
-				common.Close(oldLink.Writer)
-				common.Close(oldLink.Reader)
-			}
-			go s.pumpUoTDownlink(st.sid, link, st.udpIsConnect, dest)
+func readUoTPacket(body buf.MultiBuffer, isConnect bool, fallback M.Socksaddr) (*buf.Buffer, net.Destination, error) {
+	reader := &buf.MultiBufferContainer{MultiBuffer: body}
+	defer reader.Close()
+
+	destination := fallback
+	if !isConnect {
+		dest, err := uot.AddrParser.ReadAddrPort(reader)
+		if err != nil {
+			return nil, net.Destination{}, errors.New("anytls: UDP packet missing destination address").Base(err)
 		}
-		var length uint16
-		if err := binary.Read(first, binary.BigEndian, &length); err != nil {
-			first.Release()
-			return errors.New("anytls: UDP packet too short")
-		}
-		if !first.IsEmpty() {
-			body = append(buf.MultiBuffer{first}, body...)
-		} else {
-			first.Release()
-		}
-		if err := st.link.Writer.WriteMultiBuffer(body); err != nil {
-			return err
-		}
+		destination = dest
 	}
 
-	return nil
+	var length uint16
+	if err := binary.Read(reader, binary.BigEndian, &length); err != nil {
+		return nil, net.Destination{}, errors.New("anytls: UDP packet too short").Base(err)
+	}
+
+	payload := buf.NewWithSize(int32(length))
+	if _, err := payload.ReadFullFrom(reader, int32(length)); err != nil {
+		payload.Release()
+		return nil, net.Destination{}, errors.New("anytls: UDP packet payload too short").Base(err)
+	}
+	if !reader.MultiBuffer.IsEmpty() {
+		payload.Release()
+		return nil, net.Destination{}, errors.New("anytls: UDP packet has trailing data")
+	}
+
+	packetDest, err := singbridge.ToDestination(destination, net.Network_UDP)
+	if err != nil {
+		payload.Release()
+		return nil, net.Destination{}, errors.New("anytls: UDP packet has invalid destination address").Base(err)
+	}
+	payload.UDP = &packetDest
+	return payload, packetDest, nil
+}
+
+func (s *session) writeUoTFrameToLink(ctx context.Context, st *stream, body buf.MultiBuffer, fallback M.Socksaddr) error {
+	payload, _, err := readUoTPacket(body, st.udpIsConnect, fallback)
+	if err != nil {
+		errors.LogWarning(ctx, "anytls: UDP failed to parse packet, streamId=", st.sid, " err=", err)
+		_ = s.sendFrame(newFrame(cmdFIN, st.sid))
+		s.finishStream(st.sid, nil)
+		return nil
+	}
+	return st.link.Writer.WriteMultiBuffer(buf.MultiBuffer{payload})
 }
 
 func (s *session) pumpDownlink(sid uint32, link *transport.Link) {
@@ -372,27 +310,67 @@ func (s *session) pumpUoTDownlink(sid uint32, link *transport.Link, isConnect bo
 		if err != nil {
 			break
 		}
-		length := mb.Len()
-		if isConnect {
-			b := buf.New()
-			p := b.Extend(2)
-			binary.BigEndian.PutUint16(p, uint16(length))
-			mb = append(buf.MultiBuffer{b}, mb...)
-			if err := s.sendStreamData(sid, mb, 0); err != nil {
+		for _, b := range mb {
+			if b == nil {
+				continue
+			}
+			destination := dest
+			if b.UDP != nil {
+				destination = singbridge.ToSocksaddr(*b.UDP)
+			}
+			packet, err := buildUoTPacket(buf.MultiBuffer{b}, isConnect, destination)
+			if err != nil {
+				buf.ReleaseMulti(mb)
 				return
 			}
-		} else {
-			b1 := buf.New()
-			uot.AddrParser.WriteAddrPort(b1, dest)
-			b2 := buf.New()
-			p := b2.Extend(2)
-			binary.BigEndian.PutUint16(p, uint16(length))
-			mb = append(buf.MultiBuffer{b1, b2}, mb...)
-			if err := s.sendStreamData(sid, mb, 0); err != nil {
+			if err := s.sendStreamDataFrame(sid, packet); err != nil {
+				buf.ReleaseMulti(mb)
 				return
 			}
 		}
 	}
+}
+
+func buildUoTPacket(payload buf.MultiBuffer, isConnect bool, destination M.Socksaddr) (buf.MultiBuffer, error) {
+	length := payload.Len()
+	headerLen := int32(2)
+	if !isConnect {
+		headerLen += int32(uot.AddrParser.AddrPortLen(destination))
+	}
+	if length > maxFramePayload || headerLen+length > maxFramePayload {
+		buf.ReleaseMulti(payload)
+		return nil, errors.New("anytls: UDP packet too large")
+	}
+
+	header := buf.NewWithSize(headerLen)
+	if !isConnect {
+		if err := uot.AddrParser.WriteAddrPort(header, destination); err != nil {
+			header.Release()
+			buf.ReleaseMulti(payload)
+			return nil, err
+		}
+	}
+	p := header.Extend(2)
+	binary.BigEndian.PutUint16(p, uint16(length))
+	return append(buf.MultiBuffer{header}, payload...), nil
+}
+
+func (s *session) sendStreamDataFrame(sid uint32, data buf.MultiBuffer) error {
+	if data.IsEmpty() {
+		return nil
+	}
+	if data.Len() > maxFramePayload {
+		buf.ReleaseMulti(data)
+		return errors.New("anytls: frame payload too large")
+	}
+	defer buf.ReleaseMulti(data)
+	s.writeMu.Lock()
+	err := s.fw.writeMultiBuffer(cmdPSH, sid, data)
+	if err == nil {
+		err = s.fw.flush()
+	}
+	s.writeMu.Unlock()
+	return err
 }
 
 func (s *session) isClosed() bool {

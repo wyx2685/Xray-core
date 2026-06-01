@@ -127,6 +127,10 @@ func (s *session) openStream(ctx context.Context, target net.Destination, link *
 
 	sid := s.nextSID.Add(1) - 1
 	st := newStream(sid, link)
+	if target.Network == net.Network_UDP {
+		st.isUDP = true
+		st.udpTarget = &target
+	}
 	waitForSynAck := sid >= 2 && s.peerVersion >= 2
 	s.streamsMu.Lock()
 	s.streams[st.sid] = st
@@ -195,7 +199,7 @@ func (s *session) openStream(ctx context.Context, target net.Destination, link *
 	if target.Network == net.Network_UDP {
 		reqBuf := buf.New()
 		err := uot.WriteRequest(reqBuf, uot.Request{
-			IsConnect:   true,
+			IsConnect:   false,
 			Destination: singbridge.ToSocksaddr(target),
 		})
 		if err != nil {
@@ -227,6 +231,35 @@ func (st *stream) pumpUplink(s *session) {
 		mb, err := st.link.Reader.ReadMultiBuffer()
 		if err != nil {
 			break
+		}
+		if st.isUDP {
+			for _, b := range mb {
+				if b == nil {
+					continue
+				}
+				destination := st.udpTarget
+				if b.UDP != nil {
+					destination = b.UDP
+				}
+				if destination == nil {
+					b.Release()
+					continue
+				}
+				packet, err := buildUoTPacket(buf.MultiBuffer{b}, false, singbridge.ToSocksaddr(*destination))
+				if err != nil {
+					errors.LogDebug(context.Background(), "anytls: build UDP packet error=", err)
+					_ = s.sendFrame(newFrame(cmdFIN, st.sid))
+					s.close(err)
+					return
+				}
+				if sendErr := s.sendStreamDataFrame(st.sid, packet); sendErr != nil {
+					errors.LogDebug(context.Background(), "anytls: write UDP packet error=", sendErr)
+					_ = s.sendFrame(newFrame(cmdFIN, st.sid))
+					s.close(sendErr)
+					return
+				}
+			}
+			continue
 		}
 		var pktIndex uint32
 		s.schemeMu.RLock()
