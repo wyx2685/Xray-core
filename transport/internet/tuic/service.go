@@ -117,7 +117,8 @@ func (s *serverService) CloseWithError() error {
 
 func (s *serverService) acceptLoop(listener interface {
 	Accept(context.Context) (*quic.Conn, error)
-}) {
+},
+) {
 	for {
 		conn, err := listener.Accept(s.ctx)
 		if err != nil {

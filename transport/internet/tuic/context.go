@@ -12,8 +12,10 @@ type Authenticator interface {
 	Authenticate(ctx context.Context, uuid [16]byte, token []byte, tlsState tls.ConnectionState) (*protocol.MemoryUser, bool)
 }
 
-type authenticatorContextKey struct{}
-type settingsContextKey struct{}
+type (
+	authenticatorContextKey struct{}
+	settingsContextKey      struct{}
+)
 
 type ServerSettings struct {
 	CongestionControl string
