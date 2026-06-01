@@ -160,19 +160,7 @@ func (s *session) handleFirstUDPFrame(ctx context.Context, st *stream, body buf.
 			s.finishStream(st.sid, nil)
 			return nil
 		}
-		if !first.IsEmpty() {
-			body = append(buf.MultiBuffer{first}, body...)
-			first = nil
-		} else {
-			first.Release()
-		}
 		st.udpIsConnect = request.IsConnect
-		if !request.IsConnect {
-			errors.LogWarning(ctx, "anytls: UoT non-connect format is not supported, streamId=", st.sid)
-			_ = s.sendFrame(newFrame(cmdFIN, st.sid))
-			s.finishStream(st.sid, nil)
-			return nil
-		}
 		requestDest, err := singbridge.ToDestination(request.Destination, net.Network_UDP)
 		if err != nil {
 			first.Release()
@@ -181,7 +169,6 @@ func (s *session) handleFirstUDPFrame(ctx context.Context, st *stream, body buf.
 			s.finishStream(st.sid, nil)
 			return nil
 		}
-
 		link, err := s.dispatcher.Dispatch(s.dispatchContext(ctx, st), requestDest)
 		if err != nil {
 			errors.LogWarning(ctx, "anytls: UDP dispatcher error, streamId=", st.sid, " err=", err)
@@ -192,13 +179,63 @@ func (s *session) handleFirstUDPFrame(ctx context.Context, st *stream, body buf.
 
 		st.link = link
 		st.udpTarget = &requestDest
+
+		if !first.IsEmpty() {
+			if request.IsConnect {
+				var length uint16
+				if err := binary.Read(first, binary.BigEndian, &length); err != nil {
+					first.Release()
+					errors.LogWarning(ctx, "anytls: UDP packet too short")
+					_ = s.sendFrame(newFrame(cmdFIN, st.sid))
+					s.finishStream(st.sid, nil)
+					return nil
+				}
+			} else {
+				dest, err := uot.AddrParser.ReadAddrPort(first)
+				if err != nil {
+					first.Release()
+					errors.LogWarning(ctx, "anytls: UDP packet missing destination address")
+					_ = s.sendFrame(newFrame(cmdFIN, st.sid))
+					s.finishStream(st.sid, nil)
+					return nil
+				}
+				requestDest, err := singbridge.ToDestination(dest, net.Network_UDP)
+				if err != nil {
+					first.Release()
+					errors.LogWarning(ctx, "anytls: UDP packet has invalid destination address")
+					_ = s.sendFrame(newFrame(cmdFIN, st.sid))
+					s.finishStream(st.sid, nil)
+					return nil
+				}
+				if requestDest.String() != st.udpTarget.String() {
+					first.Release()
+					errors.LogWarning(ctx, "anytls: UDP packet destination does not match the first packet")
+					_ = s.sendFrame(newFrame(cmdFIN, st.sid))
+					s.finishStream(st.sid, nil)
+					return nil
+				}
+				var length uint16
+				if err := binary.Read(first, binary.BigEndian, &length); err != nil {
+					first.Release()
+					errors.LogWarning(ctx, "anytls: UDP packet too short")
+					_ = s.sendFrame(newFrame(cmdFIN, st.sid))
+					s.finishStream(st.sid, nil)
+					return nil
+				}
+			}
+			body = append(buf.MultiBuffer{first}, body...)
+			first = nil
+		} else {
+			first.Release()
+		}
+
 		if !body.IsEmpty() {
 			if err := st.link.Writer.WriteMultiBuffer(body); err != nil {
 				return err
 			}
 		}
 
-		go s.pumpUoTDownlink(st.sid, link, request)
+		go s.pumpUoTDownlink(st.sid, link, request.IsConnect, request.Destination)
 		return nil
 	}
 
@@ -235,10 +272,54 @@ func (s *session) handleUDPFrame(ctx context.Context, st *stream, body buf.Multi
 			return err
 		}
 	} else {
-		errors.LogWarning(ctx, "anytls: UoT non-connect format is not supported, streamId=", st.sid)
-		_ = s.sendFrame(newFrame(cmdFIN, st.sid))
-		s.finishStream(st.sid, nil)
-		return nil
+		dest, err := uot.AddrParser.ReadAddrPort(first)
+		if err != nil {
+			first.Release()
+			errors.LogWarning(ctx, "anytls: UDP packet missing destination address")
+			_ = s.sendFrame(newFrame(cmdFIN, st.sid))
+			s.finishStream(st.sid, nil)
+			return nil
+		}
+		requestDest, err := singbridge.ToDestination(dest, net.Network_UDP)
+		if err != nil {
+			first.Release()
+			errors.LogWarning(ctx, "anytls: UDP failed to parse request:", err)
+			_ = s.sendFrame(newFrame(cmdFIN, st.sid))
+			s.finishStream(st.sid, nil)
+			return nil
+		}
+
+		if st.udpTarget == nil || st.udpTarget.String() != requestDest.String() {
+			oldLink := st.link
+			link, err := s.dispatcher.Dispatch(s.dispatchContext(ctx, st), requestDest)
+			if err != nil {
+				errors.LogWarning(ctx, "anytls: UDP dispatcher error, streamId=", st.sid, " err=", err)
+				_ = s.sendFrame(newFrame(cmdFIN, st.sid))
+				s.finishStream(st.sid, nil)
+				return nil
+			}
+
+			st.link = link
+			st.udpTarget = &requestDest
+			if oldLink != nil {
+				common.Close(oldLink.Writer)
+				common.Close(oldLink.Reader)
+			}
+			go s.pumpUoTDownlink(st.sid, link, st.udpIsConnect, dest)
+		}
+		var length uint16
+		if err := binary.Read(first, binary.BigEndian, &length); err != nil {
+			first.Release()
+			return errors.New("anytls: UDP packet too short")
+		}
+		if !first.IsEmpty() {
+			body = append(buf.MultiBuffer{first}, body...)
+		} else {
+			first.Release()
+		}
+		if err := st.link.Writer.WriteMultiBuffer(body); err != nil {
+			return err
+		}
 	}
 
 	return nil
@@ -271,7 +352,7 @@ func (s *session) pumpDownlink(sid uint32, link *transport.Link) {
 	}
 }
 
-func (s *session) pumpUoTDownlink(sid uint32, link *transport.Link, request *uot.Request) {
+func (s *session) pumpUoTDownlink(sid uint32, link *transport.Link, isConnect bool, dest M.Socksaddr) {
 	defer func() {
 		s.streamsMu.Lock()
 		st := s.streams[sid]
@@ -292,14 +373,25 @@ func (s *session) pumpUoTDownlink(sid uint32, link *transport.Link, request *uot
 			break
 		}
 		length := mb.Len()
-		b := buf.New()
-		p := b.Extend(2)
-		binary.BigEndian.PutUint16(p, uint16(length))
-		mb = append(buf.MultiBuffer{b}, mb...)
-		if err := s.sendStreamData(sid, mb, 0); err != nil {
-			return
+		if isConnect {
+			b := buf.New()
+			p := b.Extend(2)
+			binary.BigEndian.PutUint16(p, uint16(length))
+			mb = append(buf.MultiBuffer{b}, mb...)
+			if err := s.sendStreamData(sid, mb, 0); err != nil {
+				return
+			}
+		} else {
+			b1 := buf.New()
+			uot.AddrParser.WriteAddrPort(b1, dest)
+			b2 := buf.New()
+			p := b2.Extend(2)
+			binary.BigEndian.PutUint16(p, uint16(length))
+			mb = append(buf.MultiBuffer{b1, b2}, mb...)
+			if err := s.sendStreamData(sid, mb, 0); err != nil {
+				return
+			}
 		}
-
 	}
 }
 
