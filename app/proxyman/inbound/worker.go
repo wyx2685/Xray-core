@@ -6,7 +6,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/xtls/xray-core/app/proxyman"
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
 	c "github.com/xtls/xray-core/common/ctx"
@@ -20,10 +19,12 @@ import (
 	"github.com/xtls/xray-core/features/stats"
 	"github.com/xtls/xray-core/proxy"
 	hysteria_proxy "github.com/xtls/xray-core/proxy/hysteria"
+	tuic_proxy "github.com/xtls/xray-core/proxy/tuic"
 	"github.com/xtls/xray-core/transport/internet"
 	"github.com/xtls/xray-core/transport/internet/hysteria"
 	"github.com/xtls/xray-core/transport/internet/stat"
 	"github.com/xtls/xray-core/transport/internet/tcp"
+	tuictransport "github.com/xtls/xray-core/transport/internet/tuic"
 	"github.com/xtls/xray-core/transport/internet/udp"
 	"github.com/xtls/xray-core/transport/pipe"
 )
@@ -137,6 +138,11 @@ func (w *tcpWorker) Start() error {
 
 	if v, ok := w.proxy.(*hysteria_proxy.Server); ok {
 		ctx = hysteria.ContextWithValidator(ctx, v.HysteriaInboundValidator())
+	}
+
+	if v, ok := w.proxy.(*tuic_proxy.Inbound); ok {
+		ctx = tuictransport.ContextWithAuthenticator(ctx, v.TUICInboundAuthenticator())
+		ctx = tuictransport.ContextWithServerSettings(ctx, v.TUICInboundSettings())
 	}
 
 	hub, err := internet.ListenTCP(ctx, w.address, w.port, w.stream, func(conn stat.Connection) {
@@ -565,67 +571,4 @@ func IsLocal(ip net.IP) bool {
 		}
 	}
 	return false
-}
-
-// tuicWorker is a worker for TUIC inbound
-type tuicWorker struct {
-	tag             string
-	proxy           proxy.Inbound
-	address         net.Address
-	port            net.Port
-	dispatcher      routing.Dispatcher
-	sniffingConfig  *proxyman.SniffingConfig
-	uplinkCounter   stats.Counter
-	downlinkCounter stats.Counter
-	stream          *internet.MemoryStreamConfig
-
-	hub internet.Listener
-
-	ctx context.Context
-}
-
-func (w *tuicWorker) Start() error {
-	ctx := w.ctx
-	// Put dispatcher into context so TUIC callbacks can retrieve it via session.DispatcherFromContext
-	ctx = session.ContextWithDispatcher(ctx, w.dispatcher)
-	ctx = context.WithValue(ctx, "xray_proxy_inbound", w.proxy)
-	ctx = context.WithValue(ctx, "inbound_tag", w.tag)
-	sid := session.NewID()
-	ctx = c.ContextWithID(ctx, sid)
-
-	// The tuic transport listener is registered in transport/internet/singquic/hub.go
-	// It will be called through the protocol name in streamSettings
-	// We use nil as handler because TUIC handles connections through ServerHandler callbacks
-	hub, err := internet.ListenTCP(ctx, w.address, w.port, w.stream, nil)
-	if err != nil {
-		return errors.New("failed to listen TUIC on ", w.port).AtWarning().Base(err)
-	}
-	w.hub = hub
-	// Note: TUIC handles connections internally through ServerHandler callbacks
-	// No need to call Accept() or handle connections here
-	return nil
-}
-
-func (w *tuicWorker) Close() error {
-	var errs []interface{}
-	if w.hub != nil {
-		if err := common.Close(w.hub); err != nil {
-			errs = append(errs, err)
-		}
-		if err := common.Close(w.proxy); err != nil {
-			errs = append(errs, err)
-		}
-	}
-	if len(errs) > 0 {
-		return errors.New("failed to close all resources").Base(errors.New(serial.Concat(errs...)))
-	}
-	return nil
-}
-
-func (w *tuicWorker) Port() net.Port {
-	return w.port
-}
-
-func (w *tuicWorker) Proxy() proxy.Inbound {
-	return w.proxy
 }

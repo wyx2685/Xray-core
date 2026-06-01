@@ -120,7 +120,7 @@ func (s *session) openStream(ctx context.Context, target net.Destination, link *
 	if target.Network == net.Network_UDP {
 		actualDest = net.Destination{
 			Network: net.Network_TCP,
-			Address: net.ParseAddress("sp.v2.udp-over-tcp.arpa"),
+			Address: net.ParseAddress(uot.MagicAddress),
 			Port:    0,
 		}
 	}
@@ -195,10 +195,8 @@ func (s *session) openStream(ctx context.Context, target net.Destination, link *
 	if target.Network == net.Network_UDP {
 		reqBuf := buf.New()
 		err := uot.WriteRequest(reqBuf, uot.Request{
-			Destination: M.Socksaddr{
-				Fqdn: target.Address.String(),
-				Port: target.Port.Value(),
-			},
+			IsConnect:   true,
+			Destination: singbridge.ToSocksaddr(target),
 		})
 		if err != nil {
 			reqBuf.Release()

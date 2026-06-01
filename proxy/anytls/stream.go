@@ -19,9 +19,10 @@ type stream struct {
 	err      error
 	dieHook  func()
 
-	dispatchCtx context.Context
-	isUDP       bool
-	udpTarget   *xnet.Destination
+	dispatchCtx  context.Context
+	isUDP        bool
+	udpTarget    *xnet.Destination
+	udpIsConnect bool
 }
 
 func newStream(sid uint32, link *transport.Link) *stream {

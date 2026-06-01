@@ -127,26 +127,6 @@ func NewAlwaysOnInboundHandler(ctx context.Context, tag string, receiverConfig *
 	if pl != nil {
 		for _, pr := range pl.Range {
 			for port := pr.From; port <= pr.To; port++ {
-				// Special handling for TUIC: use transport layer listener instead of standard UDP worker
-				if mss.ProtocolName == "tuic" && net.HasNetwork(nl, net.Network_UDP) {
-					errors.LogDebug(ctx, "creating TUIC worker on ", address, ":", port)
-
-					worker := &tuicWorker{
-						tag:             tag,
-						proxy:           p,
-						address:         address,
-						port:            net.Port(port),
-						dispatcher:      h.mux,
-						sniffingConfig:  receiverConfig.SniffingSettings,
-						uplinkCounter:   uplinkCounter,
-						downlinkCounter: downlinkCounter,
-						stream:          mss,
-						ctx:             ctx,
-					}
-					h.workers = append(h.workers, worker)
-					continue
-				}
-
 				if net.HasNetwork(nl, net.Network_TCP) {
 					errors.LogDebug(ctx, "creating stream worker on ", address, ":", port)
 
