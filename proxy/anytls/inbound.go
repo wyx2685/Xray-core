@@ -88,6 +88,7 @@ func (s *Server) Process(ctx context.Context, network xnet.Network, conn stat.Co
 	}
 	sess.fw = newFrameWriter(sess.bw)
 	sess.peerVersion = 1
+	defer sess.close(nil)
 
 	// auth header: 32B sha256(password) + 2B padlen
 	var h [34]byte
