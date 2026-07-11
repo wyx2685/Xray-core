@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"io"
 	"sync"
 	"time"
 
@@ -122,14 +123,13 @@ func (i *Inbound) Process(ctx context.Context, network net.Network, connection s
 }
 
 func (i *Inbound) processTCP(ctx context.Context, conn stat.Connection, dispatcher routing.Dispatcher) error {
-	iConn := stat.TryUnwrapStatsConn(conn)
-	type destinationConn interface{ Destination() net.Destination }
-	destinationProvider, ok := iConn.(destinationConn)
-	if !ok {
-		return errors.New("missing TUIC TCP destination")
+	destination, err := i.parseTUICStreamDestination(conn)
+	if err != nil {
+		errors.LogDebug(ctx, "TUIC TCP stream destination parse failed: ", err)
+		return errors.New("missing TUIC TCP destination").Base(err)
 	}
-	destination := destinationProvider.Destination()
 	if !destination.IsValid() {
+		errors.LogDebug(ctx, "TUIC TCP destination invalid: ", destination)
 		return errors.New("invalid TUIC TCP destination")
 	}
 
@@ -145,26 +145,30 @@ func (i *Inbound) processTCP(ctx context.Context, conn stat.Connection, dispatch
 	})
 	errors.LogDebug(ctx, "accepted TUIC TCP connection to ", destination, " user: ", email)
 
+	reader := buf.NewReader(conn)
+	writer := buf.NewWriter(conn)
+
 	return dispatcher.DispatchLink(ctx, destination, &transport.Link{
-		Reader: buf.NewReader(conn),
-		Writer: buf.NewWriter(conn),
+		Reader: reader,
+		Writer: writer,
 	})
 }
 
 func (i *Inbound) processUDP(ctx context.Context, conn stat.Connection, packetConn tuictransport.PacketConn, dispatcher routing.Dispatcher) error {
 	firstPacket, firstDestination, err := packetConn.ReadPacket()
 	if err != nil {
+		errors.LogDebug(ctx, "TUIC UDP first packet read failed: ", err)
 		return errors.New("failed to read TUIC UDP first packet").Base(err)
 	}
 	if !firstDestination.IsValid() {
+		errors.LogDebug(ctx, "TUIC UDP first packet has invalid destination: ", firstDestination)
 		return errors.New("invalid TUIC UDP destination")
 	}
 	destination := firstDestination
 	if !destination.IsValid() {
+		errors.LogDebug(ctx, "TUIC UDP destination invalid after assignment: ", destination)
 		return errors.New("invalid TUIC UDP destination")
 	}
-	firstPacketLen := len(firstPacket)
-
 	email := ""
 	if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.User != nil {
 		email = inbound.User.Email
@@ -175,7 +179,7 @@ func (i *Inbound) processUDP(ctx context.Context, conn stat.Connection, packetCo
 		Status: log.AccessAccepted,
 		Email:  email,
 	})
-	errors.LogDebug(ctx, "accepted TUIC UDP connection to ", destination, " user: ", email, " first packet: ", firstPacketLen)
+	errors.LogDebug(ctx, "accepted TUIC UDP connection to ", destination, " user: ", email)
 
 	return dispatcher.DispatchLink(ctx, destination, &transport.Link{
 		Reader: &udpPacketReader{
@@ -241,6 +245,7 @@ func (w *udpPacketWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 
 func packetToMultiBuffer(packet []byte, destination net.Destination) (buf.MultiBuffer, error) {
 	if !destination.IsValid() {
+		errors.LogDebug(context.Background(), "TUIC packetToMultiBuffer invalid destination: ", destination)
 		return nil, errors.New("invalid TUIC UDP packet destination")
 	}
 	var buffer *buf.Buffer
@@ -255,6 +260,20 @@ func packetToMultiBuffer(packet []byte, destination net.Destination) (buf.MultiB
 	}
 	buffer.UDP = &destination
 	return buf.MultiBuffer{buffer}, nil
+}
+
+func (i *Inbound) parseTUICStreamDestination(conn net.Conn) (net.Destination, error) {
+	var header [2]byte
+	if _, err := io.ReadFull(conn, header[:]); err != nil {
+		return net.Destination{}, err
+	}
+	if header[0] != tuictransport.TUICVersion {
+		return net.Destination{}, errors.New("unknown TUIC version ", header[0])
+	}
+	if header[1] != tuictransport.TUICCommandConnect {
+		return net.Destination{}, errors.New("unsupported TUIC stream command ", header[1])
+	}
+	return tuictransport.ReadDestination(conn, net.Network_TCP)
 }
 
 func (i *Inbound) AddUser(ctx context.Context, u *protocol.MemoryUser) error {

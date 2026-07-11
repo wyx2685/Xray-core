@@ -15,6 +15,7 @@ import (
 
 	"github.com/apernet/quic-go"
 
+	"github.com/xtls/xray-core/common/errors"
 	xnet "github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/protocol"
 )
@@ -242,6 +243,9 @@ func (c *udpPacketConn) writePacketOrFragments(message *udpMessage, dataLen int)
 
 func (c *udpPacketConn) inputPacket(message *udpMessage) {
 	if message.fragmentTotal <= 1 {
+		if c.isServer {
+			errors.LogDebug(c.ctx, "TUIC received UDP packet on session=", c.sessionID, " size=", len(message.data), " dest=", message.destination)
+		}
 		select {
 		case c.data <- message:
 		default:
@@ -249,6 +253,9 @@ func (c *udpPacketConn) inputPacket(message *udpMessage) {
 		return
 	}
 	if newMessage := c.defragger.feed(message); newMessage != nil {
+		if c.isServer {
+			errors.LogDebug(c.ctx, "TUIC reassembled UDP fragment set on session=", c.sessionID, " size=", len(newMessage.data))
+		}
 		select {
 		case c.data <- newMessage:
 		default:
@@ -271,12 +278,14 @@ func (c *udpPacketConn) writePacket(message *udpMessage) error {
 		return err
 	}
 	if !c.udpStream {
+		errors.LogDebug(c.ctx, "TUIC sending UDP datagram session=", c.sessionID, " size=", len(buffer))
 		return c.quicConn.SendDatagram(buffer)
 	}
 	stream, err := c.quicConn.OpenUniStream()
 	if err != nil {
 		return err
 	}
+	errors.LogDebug(c.ctx, "TUIC sending UDP stream packet session=", c.sessionID, " size=", len(buffer))
 	_, err = stream.Write(buffer)
 	closeErr := stream.Close()
 	if err != nil {

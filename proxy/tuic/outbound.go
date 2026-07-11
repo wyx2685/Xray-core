@@ -3,8 +3,6 @@ package tuic
 import (
 	"context"
 
-	"github.com/sagernet/sing-quic/tuic"
-
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/protocol"
@@ -29,7 +27,6 @@ type Outbound struct {
 	server        *protocol.ServerSpec
 	policyManager policy.Manager
 	dns           dns.Client
-	client        *tuic.Client
 }
 
 // NewOutbound creates a new TUIC outbound handler

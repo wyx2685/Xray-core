@@ -1,7 +1,6 @@
 package tuic
 
 import (
-	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/binary"
@@ -15,7 +14,6 @@ import (
 	"github.com/apernet/quic-go"
 
 	"github.com/xtls/xray-core/common/errors"
-	xnet "github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/transport/internet"
 	"github.com/xtls/xray-core/transport/internet/hysteria/congestion"
@@ -126,6 +124,7 @@ func (s *serverService) acceptLoop(listener interface {
 			}
 			return
 		}
+		errors.LogDebug(s.ctx, "TUIC accepted QUIC connection from ", conn.RemoteAddr())
 		go s.handleConnection(conn)
 	}
 }
@@ -140,6 +139,7 @@ func (s *serverService) handleConnection(conn *quic.Conn) {
 		authDone:      make(chan struct{}),
 		udpConnMap:    make(map[uint16]*udpPacketConn),
 	}
+	errors.LogDebug(s.ctx, "TUIC starting session for ", conn.RemoteAddr())
 	session.handle()
 }
 
@@ -152,16 +152,18 @@ func (s *serverService) setCongestion(conn *quic.Conn) {
 
 type serverSession struct {
 	*serverService
-	ctx        context.Context
-	quicConn   *quic.Conn
-	connAccess sync.Mutex
-	connDone   chan struct{}
-	connErr    error
-	authAccess sync.Mutex
-	authDone   chan struct{}
-	authUser   *protocol.MemoryUser
-	udpAccess  sync.RWMutex
-	udpConnMap map[uint16]*udpPacketConn
+	ctx           context.Context
+	quicConn      *quic.Conn
+	connAccess    sync.Mutex
+	connDone      chan struct{}
+	connErr       error
+	authAccess    sync.Mutex
+	authDone      chan struct{}
+	authUser      *protocol.MemoryUser
+	udpAccess     sync.RWMutex
+	udpConnMap    map[uint16]*udpPacketConn
+	pendingAccess sync.Mutex
+	pendingTasks  []func() error
 }
 
 func (s *serverSession) handle() {
@@ -218,21 +220,37 @@ func (s *serverSession) handleUniStream(stream *quic.ReceiveStream) error {
 		}
 		s.authUser = user
 		close(s.authDone)
+		errors.LogDebug(s.ctx, "TUIC authentication succeeded for ", s.quicConn.RemoteAddr(), " user: ", user.Email)
+		go s.resumePendingTasks()
 		return nil
+	case commandPacket, commandDissociate:
+		if s.authReady() {
+			return s.handlePendingUniStream(stream, buffer)
+		}
+		errors.LogDebug(s.ctx, "TUIC queued pre-auth uni-stream command ", buffer[1], " from ", s.quicConn.RemoteAddr())
+		s.enqueuePendingTask(func() error {
+			return s.handlePendingUniStream(stream, buffer)
+		})
+		return nil
+	default:
+		return errors.New("unknown command ", buffer[1])
+	}
+}
+
+func (s *serverSession) handlePendingUniStream(stream *quic.ReceiveStream, header []byte) error {
+	if err := s.waitAuth(); err != nil {
+		return err
+	}
+	switch header[1] {
 	case commandPacket:
-		if err := s.waitAuth(); err != nil {
-			return err
-		}
 		message := new(udpMessage)
-		if err := readUDPMessage(message, io.MultiReader(bytes.NewReader(buffer[2:]), stream)); err != nil {
+		if err := readUDPMessage(message, stream); err != nil {
 			return err
 		}
+		errors.LogDebug(s.ctx, "TUIC processed UDP relay packet from uni-stream session=", message.sessionID, " size=", len(message.data), " dest=", message.destination)
 		s.handleUDPMessage(message, true)
 		return nil
 	case commandDissociate:
-		if err := s.waitAuth(); err != nil {
-			return err
-		}
 		var sessionID uint16
 		if err := binary.Read(stream, binary.BigEndian, &sessionID); err != nil {
 			return err
@@ -241,6 +259,7 @@ func (s *serverSession) handleUniStream(stream *quic.ReceiveStream) error {
 		udpConn := s.udpConnMap[sessionID]
 		s.udpAccess.RUnlock()
 		if udpConn != nil {
+			errors.LogDebug(s.ctx, "TUIC dissociating UDP session ", sessionID, " from ", s.quicConn.RemoteAddr())
 			udpConn.closeWithError(io.ErrClosedPipe)
 			s.udpAccess.Lock()
 			delete(s.udpConnMap, sessionID)
@@ -248,7 +267,7 @@ func (s *serverSession) handleUniStream(stream *quic.ReceiveStream) error {
 		}
 		return nil
 	default:
-		return errors.New("unknown command ", buffer[1])
+		return errors.New("unknown command ", header[1])
 	}
 }
 
@@ -280,38 +299,32 @@ func (s *serverSession) loopStreams() {
 }
 
 func (s *serverSession) handleStream(stream *quic.Stream) error {
-	header := make([]byte, 2)
-	if _, err := io.ReadFull(stream, header); err != nil {
-		return err
+	if s.authReady() {
+		return s.handlePendingStream(stream)
 	}
-	if header[0] != tuicVersion {
-		return errors.New("unknown version ", header[0])
-	}
-	if header[1] != commandConnect {
-		return errors.New("unsupported stream command ", header[1])
-	}
-	destination, err := readDestination(stream, xnet.Network_TCP)
-	if err != nil {
-		return err
-	}
+	errors.LogDebug(s.ctx, "TUIC queued pre-auth connect stream from ", s.quicConn.RemoteAddr())
+	s.enqueuePendingTask(func() error {
+		return s.handlePendingStream(stream)
+	})
+	return nil
+}
+
+func (s *serverSession) handlePendingStream(stream *quic.Stream) error {
 	if err := s.waitAuth(); err != nil {
 		return err
 	}
-	conn := &serverConn{
-		Stream:      stream,
-		local:       s.localAddr,
-		remote:      s.quicConn.RemoteAddr(),
-		destination: destination,
-		user:        s.authUser,
+	conn := &streamConn{
+		Stream: stream,
+		local:  s.localAddr,
+		remote: s.quicConn.RemoteAddr(),
+		user:   s.authUser,
 	}
+	errors.LogDebug(s.ctx, "TUIC accepting TCP relay stream from ", s.quicConn.RemoteAddr(), " user=", s.authUser.Email)
 	s.handler(conn)
 	return nil
 }
 
 func (s *serverSession) loopMessages() {
-	if err := s.waitAuth(); err != nil {
-		return
-	}
 	for {
 		data, err := s.quicConn.ReceiveDatagram(s.ctx)
 		if err != nil {
@@ -334,10 +347,18 @@ func (s *serverSession) handleMessage(data []byte) error {
 	}
 	switch data[1] {
 	case commandPacket:
+		if !s.authReady() {
+			errors.LogDebug(s.ctx, "TUIC queued pre-auth datagram from ", s.quicConn.RemoteAddr())
+			s.enqueuePendingTask(func() error {
+				return s.handleMessage(data)
+			})
+			return nil
+		}
 		message := new(udpMessage)
 		if err := decodeUDPMessage(message, data[2:]); err != nil {
 			return err
 		}
+		errors.LogDebug(s.ctx, "TUIC processed UDP relay packet from datagram session=", message.sessionID, " size=", len(message.data), " dest=", message.destination)
 		s.handleUDPMessage(message, false)
 		return nil
 	case commandHeartbeat:
@@ -352,6 +373,7 @@ func (s *serverSession) handleUDPMessage(message *udpMessage, udpStream bool) {
 	udpConn := s.udpConnMap[message.sessionID]
 	s.udpAccess.RUnlock()
 	if udpConn == nil || udpConn.done() {
+		errors.LogDebug(s.ctx, "TUIC creating UDP relay session ", message.sessionID, " from ", s.quicConn.RemoteAddr(), " viaStream=", udpStream)
 		newUDPConn := newUDPPacketConn(s.ctx, s.quicConn, udpStream, true, s.authUser, func() {
 			s.udpAccess.Lock()
 			delete(s.udpConnMap, message.sessionID)
@@ -372,11 +394,47 @@ func (s *serverSession) handleUDPMessage(message *udpMessage, udpStream bool) {
 	shouldStart := udpConn.markStarted(destination)
 	udpConn.inputPacket(message)
 	if !shouldStart {
+		errors.LogDebug(s.ctx, "TUIC relaying UDP packet for existing session ", message.sessionID)
 		return
 	}
+	errors.LogDebug(s.ctx, "TUIC started UDP relay session ", message.sessionID, " for ", message.destination)
 	go func() {
 		s.handler(udpConn)
 	}()
+}
+
+func (s *serverSession) authReady() bool {
+	select {
+	case <-s.authDone:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *serverSession) enqueuePendingTask(task func() error) {
+	if task == nil {
+		return
+	}
+	s.pendingAccess.Lock()
+	defer s.pendingAccess.Unlock()
+	s.pendingTasks = append(s.pendingTasks, task)
+}
+
+func (s *serverSession) resumePendingTasks() {
+	s.pendingAccess.Lock()
+	tasks := s.pendingTasks
+	s.pendingTasks = nil
+	s.pendingAccess.Unlock()
+	for _, task := range tasks {
+		if task == nil {
+			continue
+		}
+		if err := task(); err != nil {
+			s.closeWithError(errors.New("resume pending task").Base(err))
+			return
+		}
+	}
 }
 
 func (s *serverSession) waitAuth() error {
@@ -400,35 +458,32 @@ func (s *serverSession) closeWithError(err error) {
 	}
 	if err != nil && !stderrors.Is(err, context.Canceled) && !stderrors.Is(err, quic.ErrServerClosed) {
 		errors.LogWarning(s.ctx, "TUIC connection closed: ", err)
+	} else {
+		errors.LogDebug(s.ctx, "TUIC connection closed: ", err)
 	}
 	_ = s.quicConn.CloseWithError(0, "")
 }
 
-type serverConn struct {
+type streamConn struct {
 	*quic.Stream
-	local       stdnet.Addr
-	remote      stdnet.Addr
-	destination xnet.Destination
-	user        *protocol.MemoryUser
+	local  stdnet.Addr
+	remote stdnet.Addr
+	user   *protocol.MemoryUser
 }
 
-func (c *serverConn) User() *protocol.MemoryUser {
+func (c *streamConn) User() *protocol.MemoryUser {
 	return c.user
 }
 
-func (c *serverConn) Destination() xnet.Destination {
-	return c.destination
-}
-
-func (c *serverConn) LocalAddr() stdnet.Addr {
+func (c *streamConn) LocalAddr() stdnet.Addr {
 	return c.local
 }
 
-func (c *serverConn) RemoteAddr() stdnet.Addr {
+func (c *streamConn) RemoteAddr() stdnet.Addr {
 	return c.remote
 }
 
-func (c *serverConn) Close() error {
+func (c *streamConn) Close() error {
 	c.Stream.CancelRead(0)
 	return c.Stream.Close()
 }

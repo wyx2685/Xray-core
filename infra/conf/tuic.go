@@ -10,7 +10,7 @@ import (
 
 // TuicUserConfig is user configuration for TUIC
 type TuicUserConfig struct {
-	UUID     string `json:"uuid"`
+	ID       string `json:"id"`
 	Password string `json:"password"`
 	Level    byte   `json:"level"`
 	Email    string `json:"email"`
@@ -53,15 +53,15 @@ func (c *TuicServerConfig) Build() (proto.Message, error) {
 
 	// Build users
 	for _, user := range c.Users {
-		if user.UUID == "" {
-			return nil, errors.New("TUIC: UUID is required for user")
+		if user.ID == "" {
+			return nil, errors.New("TUIC: id is required for user")
 		}
 		if user.Password == "" {
 			return nil, errors.New("TUIC: password is required for user")
 		}
 
 		account := &tuic.Account{
-			Uuid:     user.UUID,
+			Uuid:     user.ID,
 			Password: user.Password,
 		}
 
@@ -81,7 +81,7 @@ type TuicServerTarget struct {
 	Port     uint16   `json:"port"`
 	Level    byte     `json:"level"`
 	Email    string   `json:"email"`
-	UUID     string   `json:"uuid"`
+	ID       string   `json:"id"`
 	Password string   `json:"password"`
 }
 
@@ -91,7 +91,7 @@ type TuicClientConfig struct {
 	Port              uint16              `json:"port"`
 	Level             byte                `json:"level"`
 	Email             string              `json:"email"`
-	UUID              string              `json:"uuid"`
+	ID                string              `json:"id"`
 	Password          string              `json:"password"`
 	Servers           []*TuicServerTarget `json:"servers"`
 	CongestionControl string              `json:"congestionControl"`
@@ -110,7 +110,7 @@ func (c *TuicClientConfig) Build() (proto.Message, error) {
 				Port:     c.Port,
 				Level:    c.Level,
 				Email:    c.Email,
-				UUID:     c.UUID,
+				ID:       c.ID,
 				Password: c.Password,
 			},
 		}
@@ -146,8 +146,8 @@ func (c *TuicClientConfig) Build() (proto.Message, error) {
 		if server.Port == 0 {
 			return nil, errors.New("TUIC: invalid server port")
 		}
-		if server.UUID == "" {
-			return nil, errors.New("TUIC: UUID is not specified")
+		if server.ID == "" {
+			return nil, errors.New("TUIC: id is not specified")
 		}
 		if server.Password == "" {
 			return nil, errors.New("TUIC: password is not specified")
@@ -160,7 +160,7 @@ func (c *TuicClientConfig) Build() (proto.Message, error) {
 				Level: uint32(server.Level),
 				Email: server.Email,
 				Account: serial.ToTypedMessage(&tuic.Account{
-					Uuid:     server.UUID,
+					Uuid:     server.ID,
 					Password: server.Password,
 				}),
 			},

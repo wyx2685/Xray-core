@@ -9,13 +9,23 @@ import (
 )
 
 const (
-	tuicVersion = 5
+	tuicVersion byte = 5
 
-	commandAuthenticate byte = iota
-	commandConnect
-	commandPacket
-	commandDissociate
-	commandHeartbeat
+	commandAuthenticate byte = 0
+	commandConnect      byte = 1
+	commandPacket       byte = 2
+	commandDissociate   byte = 3
+	commandHeartbeat    byte = 4
+)
+
+const (
+	TUICVersion byte = tuicVersion
+
+	TUICCommandAuthenticate byte = commandAuthenticate
+	TUICCommandConnect      byte = commandConnect
+	TUICCommandPacket       byte = commandPacket
+	TUICCommandDissociate   byte = commandDissociate
+	TUICCommandHeartbeat    byte = commandHeartbeat
 )
 
 const authenticateLen = 2 + 16 + 32
@@ -26,6 +36,10 @@ const (
 	addressTypeIPv6   byte = 0x02
 	addressTypeNone   byte = 0xff
 )
+
+func ReadDestination(reader io.Reader, network xnet.Network) (xnet.Destination, error) {
+	return readDestination(reader, network)
+}
 
 func readDestination(reader io.Reader, network xnet.Network) (xnet.Destination, error) {
 	var addressType [1]byte
