@@ -60,6 +60,42 @@ func getTProxyType(s *internet.MemoryStreamConfig) internet.SocketConfig_TProxyM
 	return s.SocketSettings.Tproxy
 }
 
+// underlyingLocalAddr returns the local address of the real accepted OS socket,
+// unwrapping any transport/stat/proxy-protocol layers. This matters when
+// AcceptProxyProtocol is enabled: *proxyproto.Conn.LocalAddr() returns the
+// address carried in the PROXY header (typically 0.0.0.0 when the upstream
+// relay listens on a wildcard address), which silently breaks
+// sendThrough:"origin" (it ends up binding 0.0.0.0 -> OS picks the primary IP).
+// The genuine getsockname() value is the IP the peer actually connected to,
+// which is exactly what "origin" needs. When no proxy-protocol layer is present
+// this returns the same value as conn.LocalAddr(), so behaviour is unchanged in
+// the common case.
+func underlyingLocalAddr(conn net.Conn) net.Addr {
+	for i := 0; i < 8 && conn != nil; i++ {
+		switch c := conn.(type) {
+		case *stat.CounterConnection:
+			conn = c.Connection
+		case interface{ Raw() net.Conn }: // *proxyproto.Conn
+			if raw := c.Raw(); raw != nil {
+				return raw.LocalAddr()
+			}
+			return conn.LocalAddr()
+		case interface{ NetConn() net.Conn }: // *tls.Conn
+			if nc := c.NetConn(); nc != nil {
+				conn = nc
+				continue
+			}
+			return conn.LocalAddr()
+		default:
+			return conn.LocalAddr()
+		}
+	}
+	if conn != nil {
+		return conn.LocalAddr()
+	}
+	return nil
+}
+
 func (w *tcpWorker) callback(conn stat.Connection) {
 	ctx, cancel := context.WithCancel(w.ctx)
 	sid := session.NewID()
@@ -111,8 +147,11 @@ func (w *tcpWorker) callback(conn stat.Connection) {
 		}
 	}
 	ctx = session.ContextWithInbound(ctx, &session.Inbound{
-		Source:  net.DestinationFromAddr(conn.RemoteAddr()),
-		Local:   net.DestinationFromAddr(conn.LocalAddr()),
+		Source: net.DestinationFromAddr(conn.RemoteAddr()),
+		// Use the real accepted-socket local address (not a proxy-protocol
+		// header override) so sendThrough:"origin" binds the actual entry IP
+		// while RemoteAddr still yields the PROXY-preserved client IP.
+		Local:   net.DestinationFromAddr(underlyingLocalAddr(conn)),
 		Gateway: net.TCPDestination(w.address, w.port),
 		Tag:     w.tag,
 		Conn:    conn,
