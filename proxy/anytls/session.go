@@ -16,6 +16,7 @@ import (
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/errors"
+	"github.com/xtls/xray-core/common/log"
 	"github.com/xtls/xray-core/common/net"
 	sessionctx "github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/common/singbridge"
@@ -64,18 +65,31 @@ type session struct {
 	dieHook       func()
 }
 
-func (s *session) dispatchContext(ctx context.Context, st *stream) context.Context {
-	if st.dispatchCtx != nil {
-		return st.dispatchCtx
+func (s *session) dispatchContext(ctx context.Context, st *stream, dest net.Destination) context.Context {
+	if st.dispatchCtx == nil {
+		dispatchCtx := sessionctx.SubContextFromMuxInbound(ctx)
+		if s.noTLS {
+			if content := sessionctx.ContentFromContext(dispatchCtx); content != nil {
+				content.SetAttribute("anytls", "notls")
+			}
+		}
+		st.dispatchCtx = dispatchCtx
 	}
-	dispatchCtx := sessionctx.SubContextFromMuxInbound(ctx)
-	if s.noTLS {
-		if content := sessionctx.ContentFromContext(dispatchCtx); content != nil {
-			content.SetAttribute("anytls", "notls")
+
+	msg := &log.AccessMessage{
+		To:     dest,
+		Status: log.AccessAccepted,
+		Reason: "",
+	}
+	if inbound := sessionctx.InboundFromContext(st.dispatchCtx); inbound != nil {
+		if inbound.Source.IsValid() {
+			msg.From = inbound.Source
+		}
+		if inbound.User != nil {
+			msg.Email = inbound.User.Email
 		}
 	}
-	st.dispatchCtx = dispatchCtx
-	return dispatchCtx
+	return log.ContextWithAccessMessage(st.dispatchCtx, msg)
 }
 
 func (s *session) handleNewStream(ctx context.Context, st *stream, body buf.MultiBuffer) error {
@@ -102,8 +116,6 @@ func (s *session) handleNewStream(ctx context.Context, st *stream, body buf.Mult
 		return errors.New("anytls: invalid destination address in SYN")
 	}
 
-	dispatchCtx := s.dispatchContext(ctx, st)
-
 	if dest.Address.String() == "sp.v2.udp-over-tcp.arpa" {
 		st.isUDP = true
 		if err := s.sendFrame(newFrame(cmdSYNACK, st.sid)); err != nil {
@@ -111,7 +123,7 @@ func (s *session) handleNewStream(ctx context.Context, st *stream, body buf.Mult
 			return err
 		}
 		if !body.IsEmpty() {
-			return s.handleFirstUDPFrame(dispatchCtx, st, body)
+			return s.handleFirstUDPFrame(ctx, st, body)
 		}
 		return nil
 	} else if strings.Contains(dest.Address.String(), "udp-over-tcp.arpa") {
@@ -121,7 +133,7 @@ func (s *session) handleNewStream(ctx context.Context, st *stream, body buf.Mult
 		return nil
 	}
 
-	l, err := s.dispatcher.Dispatch(dispatchCtx, dest)
+	l, err := s.dispatcher.Dispatch(s.dispatchContext(ctx, st, dest), dest)
 	if err != nil {
 		errors.LogWarning(ctx, "anytls: new stream dispatcher error, streamId=", st.sid, " err=", err)
 		return nil
@@ -169,7 +181,7 @@ func (s *session) handleFirstUDPFrame(ctx context.Context, st *stream, body buf.
 			s.finishStream(st.sid, nil)
 			return nil
 		}
-		link, err := s.dispatcher.Dispatch(s.dispatchContext(ctx, st), requestDest)
+		link, err := s.dispatcher.Dispatch(s.dispatchContext(ctx, st, requestDest), requestDest)
 		if err != nil {
 			errors.LogWarning(ctx, "anytls: UDP dispatcher error, streamId=", st.sid, " err=", err)
 			_ = s.sendFrame(newFrame(cmdFIN, st.sid))
@@ -291,7 +303,7 @@ func (s *session) handleUDPFrame(ctx context.Context, st *stream, body buf.Multi
 
 		if st.udpTarget == nil || st.udpTarget.String() != requestDest.String() {
 			oldLink := st.link
-			link, err := s.dispatcher.Dispatch(s.dispatchContext(ctx, st), requestDest)
+			link, err := s.dispatcher.Dispatch(s.dispatchContext(ctx, st, requestDest), requestDest)
 			if err != nil {
 				errors.LogWarning(ctx, "anytls: UDP dispatcher error, streamId=", st.sid, " err=", err)
 				_ = s.sendFrame(newFrame(cmdFIN, st.sid))
