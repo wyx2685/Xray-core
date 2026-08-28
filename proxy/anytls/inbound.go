@@ -22,6 +22,16 @@ import (
 	"github.com/xtls/xray-core/transport/internet/tls"
 )
 
+const (
+	// anytlsServerHeartInterval is how often the server pings an idle client.
+	anytlsServerHeartInterval = 30 * time.Second
+	// anytlsServerIdleTimeout is how long the server tolerates total silence
+	// (no frames, not even a heartbeat reply) before reaping the session.
+	// It must be comfortably larger than the heartbeat interval so that a
+	// single missed/slow reply does not drop a live connection.
+	anytlsServerIdleTimeout = 90 * time.Second
+)
+
 type Server struct {
 	policyManager policy.Manager
 	// lock-free read via atomic snapshot; writers use wmu and COW
@@ -117,7 +127,11 @@ func (s *Server) Process(ctx context.Context, network xnet.Network, conn stat.Co
 			return errors.New("anytls: read padding0").Base(err)
 		}
 	}
-	_ = conn.SetReadDeadline(time.Time{})
+	// Switch from the short handshake deadline to a rolling idle deadline that
+	// readLoop refreshes on every received frame. Combined with the heartbeat
+	// goroutine below, this reaps half-open/dead client connections instead of
+	// leaving their goroutines (readLoop + per-stream pumps) blocked forever.
+	_ = conn.SetReadDeadline(time.Now().Add(anytlsServerIdleTimeout))
 
 	inb := sessionctx.InboundFromContext(ctx)
 	inb.Name = protocolName
@@ -128,6 +142,10 @@ func (s *Server) Process(ctx context.Context, network xnet.Network, conn stat.Co
 	default:
 		sess.noTLS = true
 	}
+
+	heartStop := make(chan struct{})
+	defer close(heartStop)
+	go sess.serverKeepAlive(heartStop)
 
 	return sess.readLoop(ctx)
 }
