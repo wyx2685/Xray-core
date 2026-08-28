@@ -2,6 +2,7 @@ package anytls
 
 import (
 	"context"
+	"encoding/binary"
 	"time"
 
 	M "github.com/sagernet/sing/common/metadata"
@@ -127,6 +128,7 @@ func (s *session) openStream(ctx context.Context, target net.Destination, link *
 
 	sid := s.nextSID.Add(1) - 1
 	st := newStream(sid, link)
+	st.isUDP = target.Network == net.Network_UDP
 	waitForSynAck := sid >= 2 && s.peerVersion >= 2
 	s.streamsMu.Lock()
 	s.streams[st.sid] = st
@@ -239,12 +241,39 @@ func (st *stream) pumpUplink(s *session) {
 			pktIndex = 0
 		}
 
-		if sendErr := s.sendStreamData(st.sid, mb, pktIndex); sendErr != nil {
+		var sendErr error
+		if st.isUDP {
+			sendErr = s.sendUoTUplink(st.sid, mb, pktIndex)
+		} else {
+			sendErr = s.sendStreamData(st.sid, mb, pktIndex)
+		}
+		if sendErr != nil {
 			errors.LogDebug(context.Background(), "anytls: writePacketWithPadding error=", sendErr)
 			_ = s.sendFrame(newFrame(cmdFIN, st.sid))
 			s.close(sendErr)
 			return
 		}
 
+	}
+}
+
+func (s *session) sendUoTUplink(sid uint32, mb buf.MultiBuffer, packetIndex uint32) error {
+	for {
+		var b *buf.Buffer
+		mb, b = buf.SplitFirst(mb)
+		if b == nil {
+			return nil
+		}
+		if b.Len() > maxFramePayload {
+			b.Release()
+			continue
+		}
+		header := buf.New()
+		p := header.Extend(2)
+		binary.BigEndian.PutUint16(p, uint16(b.Len()))
+		if err := s.sendStreamData(sid, buf.MultiBuffer{header, b}, packetIndex); err != nil {
+			buf.ReleaseMulti(mb)
+			return err
+		}
 	}
 }

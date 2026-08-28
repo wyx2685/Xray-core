@@ -4,8 +4,8 @@ import (
 	"context"
 	"sync"
 
+	"github.com/sagernet/sing/common/uot"
 	"github.com/xtls/xray-core/common"
-	xnet "github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/transport"
 )
 
@@ -21,8 +21,9 @@ type stream struct {
 
 	dispatchCtx  context.Context
 	isUDP        bool
-	udpTarget    *xnet.Destination
 	udpIsConnect bool
+	uotRequest   *uot.Request
+	uotInput     []byte
 }
 
 func newStream(sid uint32, link *transport.Link) *stream {
@@ -36,7 +37,7 @@ func newStream(sid uint32, link *transport.Link) *stream {
 func (st *stream) close(err error) {
 	if st.done == nil {
 		if st.link != nil {
-			common.Close(st.link.Reader)
+			common.Interrupt(st.link.Reader)
 			common.Close(st.link.Writer)
 		}
 		return
@@ -46,7 +47,7 @@ func (st *stream) close(err error) {
 		st.err = err
 		st.errMu.Unlock()
 		if st.link != nil {
-			common.Close(st.link.Reader)
+			common.Interrupt(st.link.Reader)
 			common.Close(st.link.Writer)
 		}
 		close(st.done)
