@@ -11,6 +11,7 @@ import (
 
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/errors"
+	"github.com/xtls/xray-core/common/log"
 	xnet "github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/protocol"
 	sessionctx "github.com/xtls/xray-core/common/session"
@@ -79,7 +80,6 @@ func (s *Server) Close() error {
 	return nil
 }
 
-
 func (s *Server) Process(ctx context.Context, network xnet.Network, conn stat.Connection, dispatcher routing.Dispatcher) error {
 	sessPol := s.policyManager.ForLevel(0)
 	_ = conn.SetReadDeadline(time.Now().Add(sessPol.Timeouts.Handshake))
@@ -108,13 +108,17 @@ func (s *Server) Process(ctx context.Context, network xnet.Network, conn stat.Co
 	snap := s.loadStore()
 	user := snap.users[sum]
 	if user == nil {
-		return errors.New("anytls: invalid user")
+		authErr := errors.New("anytls: invalid user")
+		log.Record(&log.AccessMessage{From: conn.RemoteAddr(), Status: log.AccessRejected, Reason: authErr})
+		return authErr
 	}
 
 	padlen := binary.BigEndian.Uint16(h[32:34])
 	if padlen > 0 {
 		if err := discardBytes(sess.br, int(padlen)); err != nil {
-			return errors.New("anytls: read padding0").Base(err)
+			paddingErr := errors.New("anytls: read padding0").Base(err)
+			log.Record(&log.AccessMessage{From: conn.RemoteAddr(), Status: log.AccessRejected, Reason: paddingErr, Email: user.Email})
+			return paddingErr
 		}
 	}
 	_ = conn.SetReadDeadline(time.Time{})

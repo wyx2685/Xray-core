@@ -17,6 +17,7 @@ import (
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/errors"
+	"github.com/xtls/xray-core/common/log"
 	"github.com/xtls/xray-core/common/net"
 	sessionctx "github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/common/singbridge"
@@ -121,6 +122,15 @@ func (s *session) handleNewStream(ctx context.Context, st *stream, body buf.Mult
 		s.finishStream(st.sid, nil)
 		return nil
 	}
+	accessMessage := &log.AccessMessage{
+		From:   s.conn.RemoteAddr(),
+		To:     dest,
+		Status: log.AccessAccepted,
+	}
+	if inbound := sessionctx.InboundFromContext(ctx); inbound != nil && inbound.User != nil {
+		accessMessage.Email = inbound.User.Email
+	}
+	dispatchCtx = log.ContextWithAccessMessage(dispatchCtx, accessMessage)
 
 	l, err := s.dispatcher.Dispatch(dispatchCtx, dest)
 	if err != nil {
@@ -159,7 +169,17 @@ func (s *session) handleUDPFrame(ctx context.Context, st *stream, body buf.Multi
 		if err != nil {
 			return s.rejectUDPStream(ctx, st, errors.New("anytls: UDP invalid destination").Base(err))
 		}
-		link, err := s.dispatcher.Dispatch(s.dispatchContext(ctx, st), requestDest)
+		dispatchCtx := s.dispatchContext(ctx, st)
+		accessMessage := &log.AccessMessage{
+			From:   s.conn.RemoteAddr(),
+			To:     requestDest,
+			Status: log.AccessAccepted,
+		}
+		if inbound := sessionctx.InboundFromContext(ctx); inbound != nil && inbound.User != nil {
+			accessMessage.Email = inbound.User.Email
+		}
+		dispatchCtx = log.ContextWithAccessMessage(dispatchCtx, accessMessage)
+		link, err := s.dispatcher.Dispatch(dispatchCtx, requestDest)
 		if err != nil {
 			return s.rejectUDPStream(ctx, st, errors.New("anytls: UDP dispatcher error").Base(err))
 		}
