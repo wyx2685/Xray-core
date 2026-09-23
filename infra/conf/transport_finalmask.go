@@ -23,6 +23,7 @@ import (
 	"github.com/xtls/xray-core/transport/internet/finalmask/realm"
 	"github.com/xtls/xray-core/transport/internet/finalmask/salamander"
 	"github.com/xtls/xray-core/transport/internet/finalmask/sudoku"
+	"github.com/xtls/xray-core/transport/internet/finalmask/udphop"
 	"github.com/xtls/xray-core/transport/internet/finalmask/xdns"
 	"github.com/xtls/xray-core/transport/internet/finalmask/xicmp"
 	"github.com/xtls/xray-core/transport/internet/finalmask/xmc"
@@ -83,6 +84,7 @@ var (
 		"xdns":          func() interface{} { return new(Xdns) },
 		"xicmp":         func() interface{} { return new(Xicmp) },
 		"realm":         func() interface{} { return new(Realm) },
+		"udphop":        func() interface{} { return new(UDPHop) },
 	}, "type", "settings")
 )
 
@@ -905,6 +907,52 @@ func (c *Realm) Build() (proto.Message, error) {
 	}, nil
 }
 
+type UDPHop struct {
+	Mode        string     `json:"mode"`
+	Interval    Int32Range `json:"interval"`
+	RemoteIPs   []string   `json:"remoteIPs"`
+	RemotePorts PortList   `json:"remotePorts"`
+}
+
+func (c *UDPHop) Build() (proto.Message, error) {
+	var local, remote, remoteOnce bool
+	for _, mode := range strings.Split(c.Mode, ",") {
+		switch strings.ToLower(mode) {
+		case "intervallocal":
+			local = true
+		case "intervalremote":
+			remote = true
+		case "perconnremote":
+			remoteOnce = true
+		default:
+			return nil, errors.New("invalid mode ", mode)
+		}
+	}
+	var remoteIPs []string
+	for _, ip := range c.RemoteIPs {
+		prefix, err := netip.ParsePrefix(ip)
+		if err == nil {
+			remoteIPs = append(remoteIPs, prefix.String())
+			continue
+		}
+		addr, err := netip.ParseAddr(ip)
+		if err == nil {
+			remoteIPs = append(remoteIPs, netip.PrefixFrom(addr, addr.BitLen()).String())
+			continue
+		}
+		return nil, errors.New("invalid ip ", ip)
+	}
+	return &udphop.Config{
+		Local:       local,
+		Remote:      remote,
+		RemoteOnce:  remoteOnce,
+		IntervalMin: int64(c.Interval.From),
+		IntervalMax: int64(c.Interval.To),
+		RemoteIPs:   remoteIPs,
+		RemotePorts: c.RemotePorts.Build().Ports(),
+	}, nil
+}
+
 type Mask struct {
 	Type     string           `json:"type"`
 	Settings *json.RawMessage `json:"settings"`
@@ -938,7 +986,6 @@ type QuicParamsConfig struct {
 	BrutalUp                      Bandwidth `json:"brutalUp"`
 	BrutalDown                    Bandwidth `json:"brutalDown"`
 	BrutalDisableLossCompensation bool      `json:"brutalDisableLossCompensation"`
-	UdpHop                        UdpHop    `json:"udpHop"`
 	InitStreamReceiveWindow       uint64    `json:"initStreamReceiveWindow"`
 	MaxStreamReceiveWindow        uint64    `json:"maxStreamReceiveWindow"`
 	InitConnectionReceiveWindow   uint64    `json:"initConnectionReceiveWindow"`
