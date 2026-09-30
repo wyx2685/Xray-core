@@ -21,8 +21,8 @@ import (
 	"github.com/xtls/xray-core/common/log"
 	"github.com/xtls/xray-core/common/net"
 	sessionctx "github.com/xtls/xray-core/common/session"
-	"github.com/xtls/xray-core/common/singbridge"
 	"github.com/xtls/xray-core/features/routing"
+	"github.com/xtls/xray-core/proxy/anytls/singbridge"
 	"github.com/xtls/xray-core/transport"
 	"github.com/xtls/xray-core/transport/internet/stat"
 )

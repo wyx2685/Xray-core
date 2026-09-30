@@ -133,7 +133,7 @@ func (c *Client) Process(ctx context.Context, link *transport.Link, dialer inter
 			return nil
 		})
 		if err != nil {
-			return errors.New("anytls: failed to establish connection").AtWarning().Base(err)
+			return errors.New("anytls: failed to establish connection").Base(err)
 		}
 
 		var auth [34]byte

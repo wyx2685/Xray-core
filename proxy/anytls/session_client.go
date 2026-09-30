@@ -10,7 +10,7 @@ import (
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/net"
-	"github.com/xtls/xray-core/common/singbridge"
+	"github.com/xtls/xray-core/proxy/anytls/singbridge"
 	"github.com/xtls/xray-core/transport"
 )
 

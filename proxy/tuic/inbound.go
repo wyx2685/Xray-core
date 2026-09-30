@@ -45,11 +45,11 @@ func NewServer(ctx context.Context, config *ServerConfig) (*Inbound, error) {
 		}
 		memUser, err := user.ToMemoryUser()
 		if err != nil {
-			return nil, errors.New("failed to get TUIC user").Base(err).AtError()
+			return nil, errors.New("failed to get TUIC user").Base(err)
 		}
 		acc, ok := memUser.Account.(*MemoryAccount)
 		if !ok {
-			return nil, errors.New("invalid TUIC account").AtError()
+			return nil, errors.New("invalid TUIC account")
 		}
 		inbound.userMap.Store(acc.UUID, memUser)
 	}
