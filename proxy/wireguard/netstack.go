@@ -21,7 +21,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/xtls/xray-core/transport/internet"
+	xnet "github.com/xtls/xray-core/common/net"
 	"golang.zx2c4.com/wireguard/tun"
 
 	"golang.org/x/net/dns/dnsmessage"
@@ -136,6 +136,7 @@ func (tun *netTun) Read(buf [][]byte, sizes []int, offset int) (int, error) {
 	}
 
 	n, err := view.Read(buf[0][offset:])
+	view.Release()
 	if err != nil {
 		return 0, err
 	}
@@ -175,6 +176,7 @@ func (tun *netTun) WriteNotify() {
 	select {
 	case tun.incomingPacket <- view:
 	case <-tun.closed:
+		view.Release()
 	}
 }
 
@@ -218,7 +220,7 @@ func (tun *netTun) DialUDPAddrPort(laddr, raddr netip.AddrPort) (net.Conn, error
 	if err != nil {
 		return nil, err
 	}
-	return &internet.PacketConnWrapper{
+	return &xnet.PacketConnWrapper{
 		PacketConn: conn,
 		Dest:       net.UDPAddrFromAddrPort(raddr),
 	}, nil

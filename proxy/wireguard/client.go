@@ -27,7 +27,6 @@ import (
 	"github.com/xtls/xray-core/features/stats"
 	"github.com/xtls/xray-core/transport"
 	"github.com/xtls/xray-core/transport/internet"
-	"github.com/xtls/xray-core/transport/internet/finalmask"
 	"golang.zx2c4.com/wireguard/device"
 )
 
@@ -199,9 +198,9 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 			return errors.New("failed to create UDP connection").Base(err)
 		}
 		defer conn.Close()
-		c := &udpConnClient{
-			PacketConn: conn.(*internet.PacketConnWrapper).PacketConn,
-			dest:       conn.RemoteAddr().(*net.UDPAddr),
+		c := &UDPConnClient{
+			PacketConn: conn.(*net.PacketConnWrapper).PacketConn,
+			Dest:       conn.RemoteAddr().(*net.UDPAddr),
 		}
 		reader = c
 		writer = c
@@ -264,14 +263,14 @@ func (h *Handler) init(ctx context.Context) error {
 			if err != nil {
 				return nil, errors.New("failed to dial to dest").Base(err)
 			}
-			pktConn = conn.(*finalmask.PacketConnWrapper).PacketConn
+			pktConn = conn.(*net.PacketConnWrapper).PacketConn
 		} else {
 			conn, err := internet.DialSystem(ctx, dest, h.streamSettings.SocketSettings)
 			if err != nil {
 				return nil, errors.New("failed to dial to dest").Base(err)
 			}
 			switch c := conn.(type) {
-			case *internet.PacketConnWrapper:
+			case *net.PacketConnWrapper:
 				pktConn = c.PacketConn
 			case *cnc.Connection:
 				pktConn = &internet.FakePacketConn{Conn: c}
@@ -288,7 +287,13 @@ func (h *Handler) init(ctx context.Context) error {
 		}
 		return pktConn, nil
 	}
-	bind := &bind{}
+	// device.NewDevice may use the bind right away (Up -> BindUpdate -> Open),
+	// so everything it reads must be set before creating the device.
+	bind := &bind{
+		resolveFunc: resolveFunc,
+		listenFunc:  listenFunc,
+		reserved:    h.conf.Reserved,
+	}
 	logger := &device.Logger{
 		Verbosef: func(format string, args ...any) {
 			log.Record(&log.GeneralMessage{
@@ -304,10 +309,7 @@ func (h *Handler) init(ctx context.Context) error {
 		},
 	}
 	dev := device.NewDevice(h.tun, bind, logger)
-	bind.resolveFunc = resolveFunc
-	bind.listenFunc = listenFunc
-	bind.downFunc = dev.Down
-	bind.reserved = h.conf.Reserved
+	bind.setDownFunc(dev.Down)
 	var cfg strings.Builder
 	cfg.WriteString("private_key=" + h.conf.SecretKey + "\n")
 	for _, peer := range h.conf.Peers {
@@ -336,6 +338,9 @@ func (h *Handler) init(ctx context.Context) error {
 }
 
 func (h *Handler) resolveLocal(host string) (net.IP, error) {
+	if ip := net.ParseIP(host); ip != nil {
+		return ip, nil
+	}
 	ips, _, err := h.dns.LookupIP(host, dns.IPOption{IPv4Enable: true, IPv6Enable: true})
 	if err != nil {
 		return nil, err
@@ -375,12 +380,12 @@ func (h *Handler) resolveLocal(host string) (net.IP, error) {
 	return got[dice.Roll(len(got))], nil
 }
 
-type udpConnClient struct {
+type UDPConnClient struct {
 	net.PacketConn
-	dest *net.UDPAddr
+	Dest *net.UDPAddr
 }
 
-func (c *udpConnClient) ReadMultiBuffer() (buf.MultiBuffer, error) {
+func (c *UDPConnClient) ReadMultiBuffer() (buf.MultiBuffer, error) {
 	b := buf.New()
 	b.Resize(0, buf.Size)
 	n, addr, err := c.PacketConn.ReadFrom(b.Bytes())
@@ -399,9 +404,9 @@ func (c *udpConnClient) ReadMultiBuffer() (buf.MultiBuffer, error) {
 	return buf.MultiBuffer{b}, nil
 }
 
-func (c *udpConnClient) WriteMultiBuffer(mb buf.MultiBuffer) error {
+func (c *UDPConnClient) WriteMultiBuffer(mb buf.MultiBuffer) error {
 	for i, b := range mb {
-		dst := c.dest
+		dst := c.Dest
 		if b.UDP != nil {
 			if b.UDP.Address.Family().IsDomain() {
 				if b.UDP.Port != net.Port(dst.Port) {
@@ -459,19 +464,26 @@ func (c *cache) run() {
 		return
 	}
 	c.running = true
-	c.m = make(map[string]entry)
+	if c.m == nil {
+		c.m = make(map[string]entry)
+	}
 	go c.gc()
 }
 
 func (c *cache) gc() {
 	ticker := time.NewTicker(time.Minute)
-	for {
-		now := <-ticker.C
+	defer ticker.Stop()
+	for now := range ticker.C {
 		c.mu.Lock()
 		for key, entry := range c.m {
 			if now.After(entry.deadline) {
 				delete(c.m, key)
 			}
+		}
+		if len(c.m) == 0 {
+			c.running = false
+			c.mu.Unlock()
+			return
 		}
 		c.mu.Unlock()
 	}

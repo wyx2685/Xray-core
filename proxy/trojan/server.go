@@ -47,11 +47,11 @@ func NewServer(ctx context.Context, config *ServerConfig) (*Server, error) {
 	for _, user := range config.Users {
 		u, err := user.ToMemoryUser()
 		if err != nil {
-			return nil, errors.New("failed to get trojan user").Base(err).AtError()
+			return nil, errors.New("failed to get trojan user").Base(err)
 		}
 
 		if err := validator.Add(u); err != nil {
-			return nil, errors.New("failed to add user").Base(err).AtError()
+			return nil, errors.New("failed to add user").Base(err)
 		}
 	}
 
@@ -151,7 +151,7 @@ func (s *Server) Process(ctx context.Context, network net.Network, conn stat.Con
 
 	sessionPolicy := s.policyManager.ForLevel(0)
 	if err := conn.SetReadDeadline(time.Now().Add(sessionPolicy.Timeouts.Handshake)); err != nil {
-		return errors.New("unable to set read deadline").Base(err).AtWarning()
+		return errors.New("unable to set read deadline").Base(err)
 	}
 
 	// 优化：使用 buf.New() 从池中获取 buffer，而不是直接分配
@@ -224,7 +224,7 @@ func (s *Server) Process(ctx context.Context, network net.Network, conn stat.Con
 
 	destination := clientReader.Target
 	if err := conn.SetReadDeadline(time.Time{}); err != nil {
-		return errors.New("unable to set read deadline").Base(err).AtWarning()
+		return errors.New("unable to set read deadline").Base(err)
 	}
 
 	inbound := session.InboundFromContext(ctx)
@@ -407,7 +407,7 @@ func (s *Server) fallback(ctx context.Context, err error, sessionPolicy policy.S
 	}
 	apfb := napfb[name]
 	if apfb == nil {
-		return errors.New(`failed to find the default "name" config`).AtWarning()
+		return errors.New(`failed to find the default "name" config`)
 	}
 
 	if apfb[alpn] == nil {
@@ -415,7 +415,7 @@ func (s *Server) fallback(ctx context.Context, err error, sessionPolicy policy.S
 	}
 	pfb := apfb[alpn]
 	if pfb == nil {
-		return errors.New(`failed to find the default "alpn" config`).AtWarning()
+		return errors.New(`failed to find the default "alpn" config`)
 	}
 
 	path := ""
@@ -449,7 +449,7 @@ func (s *Server) fallback(ctx context.Context, err error, sessionPolicy policy.S
 	}
 	fb := pfb[path]
 	if fb == nil {
-		return errors.New(`failed to find the default "path" config`).AtWarning()
+		return errors.New(`failed to find the default "path" config`)
 	}
 
 	ctx, cancel := context.WithCancel(ctx)
@@ -465,7 +465,7 @@ func (s *Server) fallback(ctx context.Context, err error, sessionPolicy policy.S
 		}
 		return nil
 	}); err != nil {
-		return errors.New("failed to dial to " + fb.Dest).Base(err).AtWarning()
+		return errors.New("failed to dial to " + fb.Dest).Base(err)
 	}
 	defer conn.Close()
 
@@ -525,11 +525,11 @@ func (s *Server) fallback(ctx context.Context, err error, sessionPolicy policy.S
 				common.Must2(pro.Write([]byte{byte(p1 >> 8), byte(p1), byte(p2 >> 8), byte(p2)}))
 			}
 			if err := serverWriter.WriteMultiBuffer(buf.MultiBuffer{pro}); err != nil {
-				return errors.New("failed to set PROXY protocol v", fb.Xver).Base(err).AtWarning()
+				return errors.New("failed to set PROXY protocol v", fb.Xver).Base(err)
 			}
 		}
 		if err := buf.Copy(reader, serverWriter, buf.UpdateActivity(timer)); err != nil {
-			return errors.New("failed to fallback request payload").Base(err).AtInfo()
+			return errors.New("failed to fallback request payload").Base(err)
 		}
 		return nil
 	}
@@ -539,7 +539,7 @@ func (s *Server) fallback(ctx context.Context, err error, sessionPolicy policy.S
 	getResponse := func() error {
 		defer timer.SetTimeout(sessionPolicy.Timeouts.UplinkOnly)
 		if err := buf.Copy(serverReader, writer, buf.UpdateActivity(timer)); err != nil {
-			return errors.New("failed to deliver response payload").Base(err).AtInfo()
+			return errors.New("failed to deliver response payload").Base(err)
 		}
 		return nil
 	}
@@ -547,7 +547,7 @@ func (s *Server) fallback(ctx context.Context, err error, sessionPolicy policy.S
 	if err := task.Run(ctx, task.OnSuccess(postRequest, task.Close(serverWriter)), task.OnSuccess(getResponse, task.Close(writer))); err != nil {
 		common.Must(common.Interrupt(serverReader))
 		common.Must(common.Interrupt(serverWriter))
-		return errors.New("fallback ends").Base(err).AtInfo()
+		return errors.New("fallback ends").Base(err)
 	}
 
 	return nil
