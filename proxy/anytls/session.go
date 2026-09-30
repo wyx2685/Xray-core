@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	M "github.com/sagernet/sing/common/metadata"
 	"github.com/sagernet/sing/common/uot"
@@ -48,6 +49,9 @@ type session struct {
 	handshakeDone    bool
 	clientPaddingMD5 string
 	noTLS            bool
+	idleMu           sync.Mutex
+	lastReadTime     time.Time
+	connectionIdle   time.Duration
 
 	client       *Client
 	nextSID      atomic.Uint32
@@ -64,6 +68,69 @@ type session struct {
 	idleSinceNano atomic.Int64
 	inIdlePool    atomic.Bool
 	dieHook       func()
+}
+
+const serverHeartbeatTimeout = 30 * time.Second
+
+type serverIdleReader struct {
+	buf.Reader
+	session *session
+}
+
+func (r *serverIdleReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
+	mb, err := r.Reader.ReadMultiBuffer()
+	if !mb.IsEmpty() {
+		r.session.idleMu.Lock()
+		r.session.lastReadTime = time.Now()
+		r.session.idleMu.Unlock()
+	}
+	return mb, err
+}
+
+// Keeping the watchdog independent of frame writes lets it close the session
+// even while the heartbeat sender is waiting for writeMu or the network.
+func (s *session) watchServerIdle(ctx context.Context, stop <-chan struct{}) {
+	timer := time.NewTimer(s.connectionIdle)
+	defer timer.Stop()
+	var probeReadTime time.Time
+	var sendDone chan error
+	for {
+		select {
+		case <-stop:
+			return
+		case <-ctx.Done():
+			s.close(ctx.Err())
+			return
+		case err := <-sendDone:
+			sendDone = nil
+			if err != nil {
+				s.close(err)
+				return
+			}
+		case <-timer.C:
+			s.idleMu.Lock()
+			lastRead := s.lastReadTime
+			s.idleMu.Unlock()
+			if !probeReadTime.IsZero() && lastRead.Equal(probeReadTime) {
+				s.close(errors.New("anytls: heartbeat timeout"))
+				return
+			}
+			probeReadTime = time.Time{}
+			if remaining := s.connectionIdle - time.Since(lastRead); remaining > 0 {
+				timer.Reset(remaining)
+				continue
+			}
+			probeReadTime = lastRead
+			timer.Reset(serverHeartbeatTimeout)
+			// At most one heartbeat write may be outstanding per session.
+			if sendDone == nil {
+				sendDone = make(chan error, 1)
+				go func(result chan<- error) {
+					result <- s.sendFrame(newFrame(cmdHeartRequest, 0))
+				}(sendDone)
+			}
+		}
+	}
 }
 
 func (s *session) dispatchContext(ctx context.Context, st *stream) context.Context {

@@ -85,13 +85,14 @@ func (s *Server) Process(ctx context.Context, network xnet.Network, conn stat.Co
 	_ = conn.SetReadDeadline(time.Now().Add(sessPol.Timeouts.Handshake))
 
 	sess := &session{
-		isClient:   false,
-		server:     s,
-		conn:       conn,
-		br:         &buf.BufferedReader{Reader: buf.NewReader(conn)},
-		bw:         buf.NewBufferedWriter(buf.NewWriter(conn)),
-		streams:    make(map[uint32]*stream),
-		dispatcher: dispatcher,
+		isClient:       false,
+		server:         s,
+		conn:           conn,
+		br:             &buf.BufferedReader{Reader: buf.NewReader(conn)},
+		bw:             buf.NewBufferedWriter(buf.NewWriter(conn)),
+		streams:        make(map[uint32]*stream),
+		dispatcher:     dispatcher,
+		connectionIdle: sessPol.Timeouts.ConnectionIdle,
 	}
 	sess.fw = newFrameWriter(sess.bw)
 	sess.peerVersion = 1
@@ -132,6 +133,12 @@ func (s *Server) Process(ctx context.Context, network xnet.Network, conn stat.Co
 	default:
 		sess.noTLS = true
 	}
+
+	sess.lastReadTime = time.Now()
+	sess.br.Reader = &serverIdleReader{Reader: sess.br.Reader, session: sess}
+	idleStop := make(chan struct{})
+	defer close(idleStop)
+	go sess.watchServerIdle(ctx, idleStop)
 
 	return sess.readLoop(ctx)
 }
