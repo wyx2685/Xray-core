@@ -25,9 +25,6 @@ import (
 	"golang.org/x/sys/windows"
 	"golang.zx2c4.com/wintun"
 	"golang.zx2c4.com/wireguard/windows/tunnel/winipcfg"
-	"gvisor.dev/gvisor/pkg/buffer"
-	"gvisor.dev/gvisor/pkg/tcpip"
-	"gvisor.dev/gvisor/pkg/tcpip/stack"
 )
 
 //go:linkname procyield runtime.procyield
@@ -35,7 +32,7 @@ func procyield(cycles uint32)
 
 // WindowsTun is an object that handles tun network interface on Windows
 // current version is heavily stripped to do nothing more,
-// then create a network interface, to be provided as endpoint to gVisor ip stack
+// then create a network interface, whose packets are read and written through a Wintun session
 type WindowsTun struct {
 	sync.RWMutex
 
@@ -46,6 +43,7 @@ type WindowsTun struct {
 	luid     winipcfg.LUID
 	cbr      winipcfg.ChangeCallback
 	cbi      winipcfg.ChangeCallback
+	guard    outboundGuard
 	wfp      windows.Handle
 	resolver *savedResolver
 	skipStop chan struct{}
@@ -55,9 +53,6 @@ type WindowsTun struct {
 
 // WindowsTun implements Tun
 var _ Tun = (*WindowsTun)(nil)
-
-// WindowsTun implements GVisorDevice
-var _ GVisorDevice = (*WindowsTun)(nil)
 
 // NewTun creates a Wintun interface with the given name. Should a Wintun
 // interface with the same name exist, it tried to be reused.
@@ -178,6 +173,11 @@ startOver:
 		}
 		ipif, err := t.luid.IPInterface(family)
 		if err != nil {
+			// With IPv6 disabled system-wide (DisabledComponents), the adapter has no
+			// IPv6 interface at all. Skip the family unless the config asks for it.
+			if err == windows.ERROR_NOT_FOUND && family == windows.AF_INET6 && !address6 && !route6 {
+				continue
+			}
 			return err
 		}
 		ipif.RouterDiscoveryBehavior = winipcfg.RouterDiscoveryDisabled
@@ -247,30 +247,31 @@ startOver:
 	}
 
 	// With autoSystemWfpBlockLeak, once the system routes lead to the TUN,
-	// keep DNS ("dns", if dns is set), and an IP version no route of which
-	// leads to the TUN ("misconfigtun"), from leaving through the other
-	// interfaces. Addresses do not matter: without one of a version in
-	// gateway, Windows gives the TUN a link-local one.
-	leaks := t.options.AutoSystemWfpBlockLeak
-	blockDNS := slices.Contains(leaks, "dns") && len(dns) > 0
-	blockIPv4 := slices.Contains(leaks, "misconfigtun") && !route4
-	blockIPv6 := slices.Contains(leaks, "misconfigtun") && !route6
-	if (route4 || route6) && (blockDNS || blockIPv4 || blockIPv6) {
-		if t.wfp, err = blockLeaks(t.luid, blockDNS, blockIPv4, blockIPv6); err != nil {
-			var blocked []string
-			for _, b := range []struct {
-				on   bool
-				what string
-			}{{blockDNS, "DNS"}, {blockIPv4, "IPv4"}, {blockIPv6, "IPv6"}} {
-				if b.on {
-					blocked = append(blocked, b.what)
-				}
-			}
-			// Rather no TUN than a leaking one.
-			return errors.New("unable to block ", strings.Join(blocked, " and "), " outside the TUN (remove autoSystemWfpBlockLeak to run without)").Base(err)
+	// keep connections to the ports given ("dns" stands for those of DNS),
+	// Windows' DNS Client service, and an IP version no route of which leads
+	// to the TUN ("misconfigtun"), from leaving through the other interfaces.
+	// Addresses do not matter: without one of a version in gateway, Windows
+	// gives the TUN a link-local one.
+	leaks, err := ExpandWfpBlockLeak(t.options.AutoSystemWfpBlockLeak)
+	if err != nil {
+		return err
+	}
+	block := newLeakFilters(leaks, route4, route6)
+	if route4 || route6 {
+		if slices.Contains(leaks, "windnsclient") && !block.dnsClient {
+			errors.LogInfo(context.Background(), "[tun] windnsclient skipped: before Windows 11 and Server 2022, the DNS Client service only queries port 53")
 		}
-		errors.LogInfo(context.Background(), "[tun] outside the TUN, blocked DNS: ", blockDNS, ", blocked IPv4: ", blockIPv4, ", blocked IPv6: ", blockIPv6)
-		if blockDNS {
+		if block.systemDNS() && len(dns) == 0 {
+			return errors.New("keeping the system's DNS inside the TUN needs dns to be set")
+		}
+	}
+	if blocked := block.String(); (route4 || route6) && blocked != "" {
+		if t.wfp, err = blockLeaks(t.luid, block); err != nil {
+			// Rather no TUN than a leaking one.
+			return errors.New("unable to block ", blocked, " outside the TUN (remove autoSystemWfpBlockLeak to run without)").Base(err)
+		}
+		errors.LogInfo(context.Background(), "[tun] blocked outside the TUN: ", blocked)
+		if block.systemDNS() {
 			covered := slices.Clone(addresses)
 			for _, route := range routesData {
 				covered = append(covered, route.Destination)
@@ -292,10 +293,21 @@ startOver:
 	}
 
 	if updater != nil {
+		// Xray's own connections have to stay out of the IP versions routed
+		// to the TUN, which needs Windows to honor the binding to updater's
+		// interface.
+		if route4 {
+			t.guard.families = append(t.guard.families, windows.AF_INET)
+		}
+		if route6 {
+			t.guard.families = append(t.guard.families, windows.AF_INET6)
+		}
+		t.guard.check()
 		// Only a registered callback goes into the fields: a nil pointer in
 		// them would not compare equal to nil in Close.
 		cbr, err := winipcfg.RegisterRouteChangeCallback(func(notificationType winipcfg.MibNotificationType, route *winipcfg.MibIPforwardRow2) {
 			updater.Update()
+			t.guard.check()
 		})
 		if err != nil {
 			return err
@@ -303,6 +315,7 @@ startOver:
 		t.cbr = cbr
 		cbi, err := winipcfg.RegisterInterfaceChangeCallback(func(notificationType winipcfg.MibNotificationType, iface *winipcfg.MibIPInterfaceRow) {
 			updater.Update()
+			t.guard.check()
 		})
 		if err != nil {
 			return err
@@ -326,6 +339,7 @@ func (t *WindowsTun) Close() error {
 	if t.cbi != nil {
 		t.cbi.Unregister()
 	}
+	t.guard.restore()
 	if t.luid != 0 {
 		t.luid.FlushRoutes(windows.AF_INET)
 		t.luid.FlushIPAddresses(windows.AF_INET)
@@ -349,6 +363,8 @@ func (t *WindowsTun) Close() error {
 		flushDNSCache()
 	}
 	if t.session != (wintun.Session{}) {
+		// ReadPacket may be waiting for a packet
+		_ = windows.SetEvent(t.readWait)
 		t.session.End()
 	}
 	if t.adapter != nil {
@@ -385,6 +401,15 @@ func resolveOnOwn() *savedResolver {
 	net.DefaultResolver.Dial = func(ctx context.Context, network, address string) (net.Conn, error) {
 		if internet.IsSkippedDNSServer(address) {
 			return nil, errors.New("skipped DNS server ", address)
+		}
+		// A socket of the server's IP version only needs that version bound
+		// to the interface, which a dual-stack one would need both of.
+		if ap, err := netip.ParseAddrPort(address); err == nil && (network == "udp" || network == "tcp") {
+			if ap.Addr().Unmap().Is4() {
+				network += "4"
+			} else {
+				network += "6"
+			}
 		}
 		return dialer.DialContext(ctx, network, address)
 	}
@@ -488,62 +513,46 @@ func (t *WindowsTun) Index() (int, error) {
 	return int(row.InterfaceIndex), nil
 }
 
-// WritePacket implements GVisorDevice method to write one packet to the tun device
-func (t *WindowsTun) WritePacket(packetBuffer *stack.PacketBuffer) tcpip.Error {
+// WritePacket implements Tun: the two parts are copied into the ring of Wintun
+func (t *WindowsTun) WritePacket(header, payload []byte) error {
 	t.RLock()
 	defer t.RUnlock()
 	if t.closed {
-		return &tcpip.ErrClosedForSend{}
+		return windows.ERROR_HANDLE_EOF
 	}
 
-	// request buffer from Wintun
-	packet, err := t.session.AllocateSendPacket(packetBuffer.Size())
+	packet, err := t.session.AllocateSendPacket(len(header) + len(payload))
 	if err != nil {
-		return &tcpip.ErrAborted{}
+		return err
 	}
-
-	// copy the bytes of slices that compose the packet into the allocated buffer
-	var index int
-	for _, packetElement := range packetBuffer.AsSlices() {
-		index += copy(packet[index:], packetElement)
-	}
-
-	// signal Wintun to send that buffer as the packet
+	copy(packet[copy(packet, header):], payload)
 	t.session.SendPacket(packet)
 
 	return nil
 }
 
-// ReadPacket implements GVisorDevice method to read one packet from the tun device
-// It is expected that the method will not block, rather return ErrQueueEmpty when there is nothing on the line,
-// which will make the stack call Wait which should implement desired push-back
-func (t *WindowsTun) ReadPacket() (byte, *stack.PacketBuffer, error) {
-	packet, err := t.session.ReceivePacket()
-	if go_errors.Is(err, windows.ERROR_NO_MORE_ITEMS) {
-		return 0, nil, ErrQueueEmpty
-	}
-	if err != nil {
-		return 0, nil, err
-	}
-
-	version := packet[0] >> 4
-	packetBuffer := buffer.MakeWithView(buffer.NewViewWithData(packet))
-	return version, stack.NewPacketBuffer(stack.PacketBufferOptions{
-		Payload:           packetBuffer,
-		IsForwardedPacket: true,
-		OnRelease: func() {
+// ReadPacket implements Tun: it waits until Wintun has a packet and copies it out of the ring
+func (t *WindowsTun) ReadPacket(b []byte) ([]byte, error) {
+	for {
+		t.RLock()
+		if t.closed {
+			t.RUnlock()
+			return nil, windows.ERROR_HANDLE_EOF
+		}
+		packet, err := t.session.ReceivePacket()
+		if err == nil {
+			n := copy(b, packet)
 			t.session.ReleaseReceivePacket(packet)
-		},
-	}), nil
-}
-
-func (t *WindowsTun) Wait() {
-	procyield(1)
-	_, _ = windows.WaitForSingleObject(t.readWait, windows.INFINITE)
-}
-
-func (t *WindowsTun) newEndpoint() (stack.LinkEndpoint, error) {
-	return &LinkEndpoint{deviceMTU: t.options.MTU, device: t}, nil
+			t.RUnlock()
+			return b[:n], nil
+		}
+		t.RUnlock()
+		if !go_errors.Is(err, windows.ERROR_NO_MORE_ITEMS) {
+			return nil, err
+		}
+		procyield(1)
+		_, _ = windows.WaitForSingleObject(t.readWait, windows.INFINITE)
+	}
 }
 
 const (
@@ -559,9 +568,21 @@ func setinterface(network, address string, fd uintptr, iface *net.Interface) err
 
 	switch network {
 	case "tcp6", "udp6", "ip6":
+		dualStack := false
+		if network == "udp6" {
+			ipv6Only, err := windows.GetsockoptInt(windows.Handle(fd), windows.IPPROTO_IPV6, windows.IPV6_V6ONLY)
+			if err != nil {
+				return internet.NewBindError(err)
+			}
+			dualStack = ipv6Only == 0
+		}
 		err1 = windows.SetsockoptInt(windows.Handle(fd), windows.IPPROTO_IPV6, IPV6_UNICAST_IF, iface.Index)
 		if network == "udp6" {
 			err2 = windows.SetsockoptInt(windows.Handle(fd), windows.IPPROTO_IPV6, windows.IPV6_MULTICAST_IF, iface.Index)
+		}
+		// Only dual-stack UDP can send to both IPv4 and IPv6 destinations.
+		if !dualStack {
+			break
 		}
 		fallthrough
 	case "tcp4", "udp4", "ip4":
@@ -573,7 +594,10 @@ func setinterface(network, address string, fd uintptr, iface *net.Interface) err
 		panic(network + " " + address)
 	}
 
-	return errors.Combine(err1, err2, err3, err4)
+	if err := errors.Combine(err1, err2, err3, err4); err != nil {
+		return internet.NewBindError(err)
+	}
+	return nil
 }
 
 func findOutboundInterface(tunIndex int, fixedName string) (*net.Interface, error) {

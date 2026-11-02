@@ -9,13 +9,17 @@ import (
 	"fmt"
 	"net/netip"
 	"net/url"
+	"os"
 	"regexp"
 	"strings"
 
 	googleuuid "github.com/google/uuid"
 	"github.com/xtls/xray-core/common/errors"
+	"github.com/xtls/xray-core/common/geodata"
+	xlua "github.com/xtls/xray-core/common/lua"
 	"github.com/xtls/xray-core/common/net"
-	"github.com/xtls/xray-core/common/serial"
+	"github.com/xtls/xray-core/transport/internet"
+	"github.com/xtls/xray-core/transport/internet/finalmask/filter"
 	"github.com/xtls/xray-core/transport/internet/finalmask/fragment"
 	"github.com/xtls/xray-core/transport/internet/finalmask/header/custom"
 	"github.com/xtls/xray-core/transport/internet/finalmask/mkcp/aes128gcm"
@@ -29,6 +33,7 @@ import (
 	"github.com/xtls/xray-core/transport/internet/finalmask/xdns"
 	"github.com/xtls/xray-core/transport/internet/finalmask/xicmp"
 	"github.com/xtls/xray-core/transport/internet/finalmask/xmc"
+	"github.com/xtls/xray-core/transport/internet/hysteria/congestion/bbr"
 	"github.com/xtls/xray-core/transport/internet/tls"
 	"google.golang.org/protobuf/proto"
 )
@@ -71,6 +76,7 @@ var (
 	customVarNamePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
 	tcpmaskLoader = NewJSONConfigLoader(ConfigCreatorCache{
+		"filter":        func() interface{} { return new(Filter) },
 		"header-custom": func() interface{} { return new(HeaderCustomTCP) },
 		"fragment":      func() interface{} { return new(FragmentMask) },
 		"sudoku":        func() interface{} { return new(Sudoku) },
@@ -78,6 +84,7 @@ var (
 	}, "type", "settings")
 
 	udpmaskLoader = NewJSONConfigLoader(ConfigCreatorCache{
+		"filter":        func() interface{} { return new(Filter) },
 		"header-custom": func() interface{} { return new(HeaderCustomUDP) },
 		"mkcp-legacy":   func() interface{} { return new(MkcpLegacy) },
 		"noise":         func() interface{} { return new(NoiseMask) },
@@ -89,6 +96,23 @@ var (
 		"udphop":        func() interface{} { return new(UDPHop) },
 	}, "type", "settings")
 )
+
+type Filter struct {
+	BlockedSourceIPs []string `json:"blockedSourceIPs"`
+	AllowedSourceIPs []string `json:"allowedSourceIPs"`
+}
+
+func (c *Filter) Build() (proto.Message, error) {
+	rules, err := geodata.ParseIPRules(c.BlockedSourceIPs)
+	if err != nil {
+		return nil, errors.New(`invalid "blockedSourceIPs"`).Base(err)
+	}
+	allowed, err := geodata.ParseIPRules(c.AllowedSourceIPs)
+	if err != nil {
+		return nil, errors.New(`invalid "allowedSourceIPs"`).Base(err)
+	}
+	return &filter.Config{BlockedSourceIps: rules, AllowedSourceIps: allowed}, nil
+}
 
 type TCPItem struct {
 	Delay     Int32Range       `json:"delay"`
@@ -305,11 +329,26 @@ type NoiseItem struct {
 }
 
 type NoiseMask struct {
-	Reset Int32Range  `json:"reset"`
-	Noise []NoiseItem `json:"noise"`
+	Reset  Int32Range  `json:"reset"`
+	Noise  []NoiseItem `json:"noise"`
+	Script string      `json:"script"`
 }
 
 func (c *NoiseMask) Build() (proto.Message, error) {
+	if c.Script != "" {
+		if len(c.Noise) > 0 {
+			return nil, errors.New(`"script" and "noise" can't be used together`)
+		}
+		if _, err := xlua.Compile(c.Script); err != nil {
+			return nil, errors.New("failed to compile the noise script").Base(err)
+		}
+		return &noise.Config{
+			ResetMin: int64(c.Reset.From),
+			ResetMax: int64(c.Reset.To),
+			Script:   c.Script,
+		}, nil
+	}
+
 	noiseSlice := make([]*noise.Item, 0, len(c.Noise))
 	for _, item := range c.Noise {
 		if len(item.Packet) > 0 && item.Rand.To > 0 {
@@ -792,37 +831,18 @@ func (c *Sudoku) Build() (proto.Message, error) {
 }
 
 type XDNSDomain struct {
-	Name       string  `json:"name"`
-	LenLimit   int32   `json:"lenLimit"`
-	LabelLimit int32   `json:"labelLimit"`
-	Types      []int32 `json:"types"`
-	Edns0      int32   `json:"edns0"`
+	Names      []string `json:"names"`
+	LenLimit   int32    `json:"lenLimit"`
+	LabelLimit int32    `json:"labelLimit"`
+	Types      []int32  `json:"types"`
+	Edns0      int32    `json:"edns0"`
 }
-
-type XDNSResolverTCP struct {
-	Addr string `json:"addr"`
-}
-
-func (c *XDNSResolverTCP) Build() (proto.Message, error) {
-	return &xdns.TCPResolverProto{Addr: c.Addr}, nil
-}
-
-type XDNSResolverUDP struct {
-	Addr string `json:"addr"`
-}
-
-func (c *XDNSResolverUDP) Build() (proto.Message, error) {
-	return &xdns.UDPResolverProto{Addr: c.Addr}, nil
-}
-
-var xdnsLoader = NewJSONConfigLoader(ConfigCreatorCache{
-	"tcp": func() interface{} { return new(XDNSResolverTCP) },
-	"udp": func() interface{} { return new(XDNSResolverUDP) },
-}, "type", "settings")
 
 type XDNSResolver struct {
-	Type     string          `json:"type"`
-	Settings json.RawMessage `json:"settings"`
+	Addrs      []string          `json:"addrs"`
+	Worker     int32             `json:"worker"`
+	TlsConfig  *TLSConfig        `json:"tlsConfig"`
+	QuicConfig *QuicParamsConfig `json:"quicConfig"`
 }
 
 type XDNS struct {
@@ -833,7 +853,7 @@ type XDNS struct {
 
 func (c *XDNS) Build() (proto.Message, error) {
 	var domains []*xdns.DomainProto
-	var resolvers []*serial.TypedMessage
+	var resolvers []*xdns.ResolverProto
 	for i := range c.Domains {
 		if c.Domains[i].LenLimit == 0 {
 			c.Domains[i].LenLimit = 255
@@ -841,33 +861,69 @@ func (c *XDNS) Build() (proto.Message, error) {
 		if c.Domains[i].LabelLimit == 0 {
 			c.Domains[i].LabelLimit = 63
 		}
-		types := make([]uint16, 0, len(c.Domains[i].Types))
-		for j := range c.Domains[i].Types {
-			types = append(types, uint16(c.Domains[i].Types[j]))
+		for j := range c.Domains[i].Names {
+			domain, err := xdns.NewDomain(c.Domains[i].Names[j], int(c.Domains[i].LenLimit), int(c.Domains[i].LabelLimit), []uint16{1, 5, 16, 28}, uint16(c.Domains[i].Edns0))
+			if err != nil {
+				return nil, err
+			}
+			errors.LogInfo(context.Background(), domain.Show())
+			domains = append(domains, &xdns.DomainProto{
+				Name:       c.Domains[i].Names[j],
+				LenLimit:   c.Domains[i].LenLimit,
+				LabelLimit: c.Domains[i].LabelLimit,
+				Types:      c.Domains[i].Types,
+				Edns0:      c.Domains[i].Edns0,
+			})
 		}
-		domain, err := xdns.NewDomain(c.Domains[i].Name, int(c.Domains[i].LenLimit), int(c.Domains[i].LabelLimit), types, uint16(c.Domains[i].Edns0))
-		if err != nil {
-			return nil, err
-		}
-		errors.LogInfo(context.Background(), domain.Show())
-		domains = append(domains, &xdns.DomainProto{
-			Name:       c.Domains[i].Name,
-			LenLimit:   c.Domains[i].LenLimit,
-			LabelLimit: c.Domains[i].LabelLimit,
-			Types:      c.Domains[i].Types,
-			Edns0:      c.Domains[i].Edns0,
-		})
 	}
 	for i := range c.Resolvers {
-		config, err := xdnsLoader.LoadWithID(c.Resolvers[i].Settings, c.Resolvers[i].Type)
-		if err != nil {
-			return nil, err
+		worker := c.Resolvers[i].Worker
+		if worker == 0 {
+			worker = 32
 		}
-		pm, err := config.(interface{ Build() (proto.Message, error) }).Build()
-		if err != nil {
-			return nil, err
+		var tlsConfig *tls.Config
+		var quicConfig *internet.QuicParams
+		if c.Resolvers[i].TlsConfig != nil {
+			proto, err := c.Resolvers[i].TlsConfig.Build()
+			if err != nil {
+				return nil, err
+			}
+			tlsConfig = proto.(*tls.Config)
 		}
-		resolvers = append(resolvers, serial.ToTypedMessage(pm))
+		if c.Resolvers[i].QuicConfig != nil {
+			proto, err := c.Resolvers[i].QuicConfig.Build()
+			if err != nil {
+				return nil, err
+			}
+			quicConfig = proto.(*internet.QuicParams)
+		}
+		for j := range c.Resolvers[i].Addrs {
+			var u *url.URL
+			var e error
+			if !strings.Contains(c.Resolvers[i].Addrs[j], "://") {
+				u, e = url.Parse("udp://" + c.Resolvers[i].Addrs[j])
+			} else {
+				u, e = url.Parse(c.Resolvers[i].Addrs[j])
+			}
+			if e != nil {
+				return nil, e
+			}
+			var addr string
+			switch u.Scheme {
+			case "tcp", "udp":
+				host := u.Hostname()
+				port := u.Port()
+				if port == "" {
+					port = "53"
+				}
+				addr = net.JoinHostPort(host, port)
+			case "https":
+				addr = u.String()
+			default:
+				return nil, errors.New("invalid protocol")
+			}
+			resolvers = append(resolvers, &xdns.ResolverProto{Type: u.Scheme, Addr: addr, Worker: worker, TlsConfig: tlsConfig, QuicConfig: quicConfig})
+		}
 	}
 	if c.ExtraPoll < 0 || c.ExtraPoll > 3 {
 		return nil, errors.New("c.ExtraPoll < 0 || c.ExtraPoll > 3")
@@ -1157,6 +1213,91 @@ type QuicParamsConfig struct {
 	DisableGSO                    bool      `json:"disableGSO"`
 	MaxIncomingStreams            int64     `json:"maxIncomingStreams"`
 	DisableStatelessReset         bool      `json:"disableStatelessReset"`
+}
+
+func (config *QuicParamsConfig) Build() (proto.Message, error) {
+	profile := strings.ToLower(config.BbrProfile)
+	switch profile {
+	case "", string(bbr.ProfileConservative), string(bbr.ProfileStandard), string(bbr.ProfileAggressive):
+		if profile == "" {
+			profile = string(bbr.ProfileStandard)
+		}
+	default:
+		return nil, errors.New("unknown bbr profile")
+	}
+
+	up, err := config.BrutalUp.Bps()
+	if err != nil {
+		return nil, err
+	}
+	down, err := config.BrutalDown.Bps()
+	if err != nil {
+		return nil, err
+	}
+
+	if up > 0 && up < 65536 {
+		return nil, errors.New("BrutalUp must be at least 65536 bytes per second")
+	}
+	if down > 0 && down < 65536 {
+		return nil, errors.New("BrutalDown must be at least 65536 bytes per second")
+	}
+
+	config.Congestion = strings.ToLower(config.Congestion)
+	switch config.Congestion {
+	case "", "brutal", "reno", "bbr":
+	case "force-brutal":
+		if up == 0 {
+			return nil, errors.New("force-brutal requires up")
+		}
+	default:
+		return nil, errors.New("unknown congestion control: ", config.Congestion, ", valid values: reno, bbr, brutal, force-brutal")
+	}
+
+	if config.InitStreamReceiveWindow > 0 && config.InitStreamReceiveWindow < 16384 {
+		return nil, errors.New("InitStreamReceiveWindow must be at least 16384")
+	}
+	if config.MaxStreamReceiveWindow > 0 && config.MaxStreamReceiveWindow < 16384 {
+		return nil, errors.New("MaxStreamReceiveWindow must be at least 16384")
+	}
+	if config.InitConnectionReceiveWindow > 0 && config.InitConnectionReceiveWindow < 16384 {
+		return nil, errors.New("InitConnectionReceiveWindow must be at least 16384")
+	}
+	if config.MaxConnectionReceiveWindow > 0 && config.MaxConnectionReceiveWindow < 16384 {
+		return nil, errors.New("MaxConnectionReceiveWindow must be at least 16384")
+	}
+	if config.MaxIdleTimeout != 0 && (config.MaxIdleTimeout < 4 || config.MaxIdleTimeout > 120) {
+		return nil, errors.New("MaxIdleTimeout must be between 4 and 120")
+	}
+	if config.KeepAlivePeriod != 0 && (config.KeepAlivePeriod < 2 || config.KeepAlivePeriod > 60) {
+		return nil, errors.New("KeepAlivePeriod must be between 2 and 60")
+	}
+	if config.MaxIncomingStreams != 0 && config.MaxIncomingStreams < 8 {
+		return nil, errors.New("MaxIncomingStreams must be at least 8")
+	}
+
+	if config.Debug {
+		os.Setenv("HYSTERIA_BBR_DEBUG", "true")
+		os.Setenv("HYSTERIA_BRUTAL_DEBUG", "true")
+	}
+
+	return &internet.QuicParams{
+		Congestion:                    config.Congestion,
+		BbrProfile:                    profile,
+		BrutalUp:                      up,
+		BrutalDown:                    down,
+		BrutalDisableLossCompensation: config.BrutalDisableLossCompensation,
+		InitStreamReceiveWindow:       config.InitStreamReceiveWindow,
+		MaxStreamReceiveWindow:        config.MaxStreamReceiveWindow,
+		InitConnReceiveWindow:         config.InitConnectionReceiveWindow,
+		MaxConnReceiveWindow:          config.MaxConnectionReceiveWindow,
+		MaxIdleTimeout:                config.MaxIdleTimeout,
+		KeepAlivePeriod:               config.KeepAlivePeriod,
+		DisablePathMtuDiscovery:       config.DisablePathMTUDiscovery,
+		DisableChromeParrot:           config.DisableChromeParrot,
+		DisableGSO:                    config.DisableGSO,
+		MaxIncomingStreams:            config.MaxIncomingStreams,
+		DisableStatelessReset:         config.DisableStatelessReset,
+	}, nil
 }
 
 type FinalMask struct {
