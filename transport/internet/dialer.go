@@ -255,7 +255,7 @@ func DialSystem(ctx context.Context, dest net.Destination, sockopt *SocketConfig
 		}
 		ips, err := LookupForIP(dest.Address.Domain(), finalStrategy, src)
 		if err != nil {
-			errors.LogErrorInner(ctx, err, "failed to resolve ip")
+			errors.LogInfoInner(ctx, err, "failed to resolve ip")
 			if sockopt.DomainStrategy.ForceIP() {
 				return nil, err
 			}
